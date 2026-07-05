@@ -1,5 +1,9 @@
 # Melon3D
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![C++17](https://img.shields.io/badge/C%2B%2B-17-blue.svg)](https://en.cppreference.com/w/cpp/17)
+[![Dependencies: none](https://img.shields.io/badge/dependencies-none-brightgreen.svg)](#building)
+
 A compact 3D rigid body physics engine for games, built on **position-based
 dynamics (XPBD)**. Zero dependencies, C-style API, C++17 inside,
 deterministic multithreading out of the box.
