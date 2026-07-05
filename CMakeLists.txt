@@ -1,0 +1,45 @@
+cmake_minimum_required(VERSION 3.16)
+project(melon3d VERSION 1.0.0 LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+if(NOT CMAKE_BUILD_TYPE)
+	set(CMAKE_BUILD_TYPE Release)
+endif()
+
+add_library(melon3d STATIC
+	src/collide.cpp
+	src/grid.cpp
+	src/xpbd.cpp
+	src/world.cpp
+)
+target_include_directories(melon3d PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
+if(NOT MSVC)
+	target_compile_options(melon3d PRIVATE -Wall -Wextra)
+	# let the compiler use wide SIMD and FMA on the solver math
+	target_compile_options(melon3d PRIVATE $<$<CONFIG:Release>:-O3 -mavx2 -mfma>)
+endif()
+
+find_package(Threads REQUIRED)
+target_link_libraries(melon3d PUBLIC Threads::Threads)
+
+option(MELON3D_BUILD_TESTS "Build Melon3D tests" ON)
+option(MELON3D_BUILD_BENCHMARKS "Build Melon3D benchmarks" ON)
+
+if(MELON3D_BUILD_TESTS)
+	enable_testing()
+	add_executable(melon3d_tests test/test_main.cpp)
+	target_link_libraries(melon3d_tests PRIVATE melon3d)
+	add_test(NAME melon3d_tests COMMAND melon3d_tests)
+endif()
+
+if(MELON3D_BUILD_BENCHMARKS)
+	add_executable(melon3d_bench bench/bench.cpp)
+	target_link_libraries(melon3d_bench PRIVATE melon3d)
+endif()
+
+include(GNUInstallDirs)
+install(TARGETS melon3d ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+install(FILES include/melon3d.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
