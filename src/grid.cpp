@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <math.h>
+#include <string.h>
 
 namespace m3d
 {
@@ -76,9 +77,57 @@ void SpatialGrid::BuildTier(float cellSize, const std::vector<m3d_aabb>& aabbs, 
 		}
 	}
 
-	std::sort(entries.begin(), entries.end(), [](const Entry& a, const Entry& b) {
-		return a.key < b.key || (a.key == b.key && a.body < b.body);
-	});
+	// Both paths produce the unique (key, body) total order: std::sort by the
+	// comparator, and the stable radix by key (input is already body-ascending
+	// per key, since the build loop iterates bodies ascending). So the choice
+	// is bit-identical - std::sort for small sets (no histogram overhead),
+	// radix for large active sets (O(n), no comparisons).
+	if (entries.size() < 1024)
+	{
+		std::sort(entries.begin(), entries.end(), [](const Entry& a, const Entry& b) {
+			return a.key < b.key || (a.key == b.key && a.body < b.body);
+		});
+	}
+	else
+	{
+		SortEntriesByKey(entries, m_radixScratch);
+	}
+}
+
+// Stable LSD radix by the cell key: 6 passes of 11 bits (covers 66 >= 63
+// bits). Small 2048-entry histogram keeps the per-pass clear cheap.
+void SpatialGrid::SortEntriesByKey(std::vector<Entry>& entries, std::vector<Entry>& scratch)
+{
+	const size_t n = entries.size();
+	scratch.resize(n);
+	Entry* src = entries.data();
+	Entry* dst = scratch.data();
+	static const int kBits = 11, kDigits = 1 << kBits, kMask = kDigits - 1, kPasses = 6;
+	uint32_t count[kDigits];
+	for (int pass = 0; pass < kPasses; ++pass)
+	{
+		int shift = pass * kBits;
+		memset(count, 0, sizeof(count));
+		for (size_t i = 0; i < n; ++i)
+		{
+			++count[(src[i].key >> shift) & kMask];
+		}
+		uint32_t sum = 0;
+		for (int b = 0; b < kDigits; ++b)
+		{
+			uint32_t c = count[b];
+			count[b] = sum;
+			sum += c;
+		}
+		for (size_t i = 0; i < n; ++i)
+		{
+			dst[count[(src[i].key >> shift) & kMask]++] = src[i];
+		}
+		Entry* tmp = src;
+		src = dst;
+		dst = tmp;
+	}
+	// 6 passes is even -> src == entries.data() again; no final copy needed
 }
 
 void SpatialGrid::BuildActive(float cellSize, const std::vector<m3d_aabb>& aabbs, const std::vector<uint8_t>& isActive)

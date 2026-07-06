@@ -393,12 +393,14 @@ public:
 	float CellSize() const { return m_cellSize; }
 
 private:
-	static void BuildTier(float cellSize, const std::vector<m3d_aabb>& aabbs, const std::vector<uint8_t>& include,
-						  std::vector<Entry>& entries, std::vector<int32_t>& oversized, std::vector<bool>& inGrid);
+	void BuildTier(float cellSize, const std::vector<m3d_aabb>& aabbs, const std::vector<uint8_t>& include,
+				   std::vector<Entry>& entries, std::vector<int32_t>& oversized, std::vector<bool>& inGrid);
+	static void SortEntriesByKey(std::vector<Entry>& entries, std::vector<Entry>& scratch);
 
 	float m_cellSize = 1.5f;
 	std::vector<Entry> m_active; // sorted by key
 	std::vector<Entry> m_stable; // sorted by key
+	std::vector<Entry> m_radixScratch; // reused ping-pong buffer for the radix sort
 	std::vector<int32_t> m_activeOversized;
 	std::vector<int32_t> m_stableOversized;
 	std::vector<bool> m_inActive; // in active cells (not oversized)
