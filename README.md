@@ -1,5 +1,6 @@
 # Melon3D
 
+[![CI](https://github.com/MelonWithGlasses/Melon3D/actions/workflows/ci.yml/badge.svg)](https://github.com/MelonWithGlasses/Melon3D/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![C++17](https://img.shields.io/badge/C%2B%2B-17-blue.svg)](https://en.cppreference.com/w/cpp/17)
 [![Dependencies: none](https://img.shields.io/badge/dependencies-none-brightgreen.svg)](#building)
@@ -136,7 +137,7 @@ both engines can also be compared 1T vs 1T.
 | **rain** — 1000 mixed spheres/capsules/boxes falling | **0.976** (2.46) | 1.88 (5.48) | 1.059 (3.95) |
 | **stacks** — 8×8 grid of 6-box towers (384 bodies) | **0.046** (0.86) | 0.203 (1.92) | 0.057 (0.83) |
 | **towers** — 20×20 grid of 3-box towers (1200 bodies) | **0.143** (2.94) | 0.643 (5.83) | 0.238 (2.04) |
-| **pyramid** — 210-box pyramid, one contact island | **0.121** (1.59) | 0.410 (2.66) | 0.404 (2.12) |
+| **pyramid** — 210-box pyramid, one contact island | **0.121** (1.59) | 0.360 (2.75) | 0.372 (2.36) |
 
 <details>
 <summary>Raw per-run data</summary>
@@ -162,6 +163,11 @@ stacks            0.202 / 1.914     0.203 / 1.929
 rain              1.877 / 5.383     1.873 / 5.574
 towers            0.640 / 5.605     0.645 / 6.060
 churn             1.539 / 2.516     1.524 / 2.353
+
+Addendum (energy-based sleep criterion, single run):
+pyramid Melon3D   1T 0.360 / 2.745  16T 0.372 / 2.362
+(other scenes unchanged within run-to-run spread; the summary table above
+uses these updated pyramid numbers)
 ```
 </details>
 

@@ -124,6 +124,7 @@ void WakeBodyInternal(m3d_world* world, int32_t index)
 	}
 	b.isAwake = true;
 	b.sleepTime = 0.0f;
+	b.smoothedEnergy = 4.0f * kSleepEnergyThresh; // woken: restart the settle clock
 }
 
 // expanded AABB: shape AABB + margin + directional velocity extension
@@ -493,6 +494,7 @@ m3d_body_id m3d_body_create(m3d_world* world, const m3d_body_def* bodyDef, const
 	b.enableSleep = bodyDef->enableSleep && world->def.enableSleep;
 	b.isAwake = bodyDef->type == M3D_BODY_STATIC ? false : bodyDef->isAwake;
 	b.sleepTime = 0.0f;
+	b.smoothedEnergy = 4.0f * kSleepEnergyThresh; // born "hot": no instant sleep
 	b.userData = bodyDef->userData;
 
 	b.shape.type = shapeDef->type;
@@ -1324,15 +1326,20 @@ void m3d_world_step(m3d_world* world, float dt, int substepCount)
 				canSleep = false;
 				break;
 			}
-			if (m3d_length_sq(b.linearVelocity) > kSleepLinearVelSq ||
-				m3d_length_sq(b.angularVelocity) > kSleepAngularVelSq)
+			// low-pass energy with hysteresis: single-step velocity spikes
+			// (reconstruction noise) no longer reset the timer, only a
+			// sustained rise does
+			float energy = m3d_length_sq(b.linearVelocity) + m3d_length_sq(b.angularVelocity);
+			b.smoothedEnergy += kSleepEnergyAlpha * (energy - b.smoothedEnergy);
+			if (b.smoothedEnergy > kSleepWakeFactor * kSleepEnergyThresh)
 			{
 				b.sleepTime = 0.0f;
 			}
-			else
+			else if (b.smoothedEnergy < kSleepEnergyThresh)
 			{
 				b.sleepTime += dt;
 			}
+			// in the hysteresis band the timer holds its value
 			minSleepTime = fminf(minSleepTime, b.sleepTime);
 		}
 		if (canSleep && minSleepTime >= kTimeToSleep)

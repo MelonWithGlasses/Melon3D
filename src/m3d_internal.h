@@ -41,6 +41,13 @@ constexpr float kAABBMargin = 0.1f;
 constexpr float kTimeToSleep = 0.5f;
 constexpr float kSleepLinearVelSq = 0.05f * 0.05f;  // (m/s)^2
 constexpr float kSleepAngularVelSq = 0.05f * 0.05f; // (rad/s)^2
+// Sleep decisions use a low-pass-filtered energy |v|^2 + |w|^2 with
+// hysteresis instead of instantaneous velocities: XPBD velocities are
+// reconstructed from positions and carry single-step noise that would
+// otherwise keep resetting the sleep timers of settling piles.
+constexpr float kSleepEnergyThresh = kSleepLinearVelSq + kSleepAngularVelSq;
+constexpr float kSleepEnergyAlpha = 0.25f; // per-step smoothing factor
+constexpr float kSleepWakeFactor = 2.0f;   // reset timers above this multiple
 constexpr int32_t kOversizedCellSpan = 64;          // grid cells before a body goes to the coarse list
 // Islands with at least this many contacts are solved with graph coloring:
 // contacts are bucketed so no two in a bucket share a dynamic body, giving
@@ -90,6 +97,7 @@ struct Body
 	float gravityScale;
 
 	float sleepTime;
+	float smoothedEnergy; // low-pass |v|^2 + |w|^2 for sleep decisions
 	bool enableSleep;
 	bool isAwake;
 	bool inUse;
