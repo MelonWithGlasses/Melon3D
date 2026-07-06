@@ -13,6 +13,12 @@ deterministic multithreading out of the box.
 ~5k lines · MIT · sphere / capsule / box · joints · sleeping · ray casts
 ```
 
+![Melon3D demo](docs/demo.gif)
+
+*A stable box pyramid struck by a fast projectile, then a rain of mixed
+spheres, capsules and boxes settling on the debris — all simulated by
+Melon3D (rendering is a small offline script, see [`examples/`](examples/)).*
+
 ## Why another physics engine?
 
 Melon3D deliberately explores the *other* branch of the design tree from
