@@ -9,6 +9,10 @@
 #include <string.h>
 #include <unordered_set>
 
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
+
 using namespace m3d;
 
 namespace
@@ -230,7 +234,11 @@ ThreadPool::ThreadPool(int32_t workerCount)
 
 static inline void CpuRelax()
 {
-#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__)
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+	_mm_pause();
+#elif defined(_MSC_VER) && defined(_M_ARM64)
+	__yield();
+#elif defined(__x86_64__) || defined(__i386__)
 	__builtin_ia32_pause();
 #else
 	std::this_thread::yield();

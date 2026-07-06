@@ -708,7 +708,7 @@ void SolveIslandColoredXPBD(m3d_world* world, const std::vector<int32_t>& bodyIn
 			used |= world->colorMask[c.bodyB];
 		}
 		uint32_t freeBits = ~used;
-		int32_t color = freeBits != 0 ? __builtin_ctz(freeBits) : kMaxGraphColors;
+		int32_t color = freeBits != 0 ? CountTrailingZeros32(freeBits) : kMaxGraphColors;
 		if (color >= kMaxGraphColors)
 		{
 			world->overflowContacts.push_back(ci);

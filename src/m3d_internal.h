@@ -21,6 +21,10 @@
 #include <unordered_map>
 #include <vector>
 
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
+
 namespace m3d
 {
 
@@ -198,6 +202,18 @@ inline bool PoseChanged(const Body& b, m3d_vec3 cachePos, m3d_quat cacheRot)
 inline uint64_t ContactKey(int32_t a, int32_t b)
 {
 	return ((uint64_t)(uint32_t)a << 32) | (uint32_t)b;
+}
+
+// index of the lowest set bit; caller guarantees v != 0
+inline int32_t CountTrailingZeros32(uint32_t v)
+{
+#if defined(_MSC_VER)
+	unsigned long idx;
+	_BitScanForward(&idx, v);
+	return (int32_t)idx;
+#else
+	return __builtin_ctz(v);
+#endif
 }
 
 // Compute the contact manifold between two shapes. Normal points from A to B.

@@ -16,10 +16,23 @@ add_library(melon3d STATIC
 )
 target_include_directories(melon3d PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
-if(NOT MSVC)
+# SIMD flags only where the target actually is x86; Apple Silicon and other
+# ARM builds still autovectorize the branchless lane loops with NEON
+set(MELON3D_X86 FALSE)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|i[3-6]86)$")
+	set(MELON3D_X86 TRUE)
+endif()
+
+if(MSVC)
+	if(MELON3D_X86)
+		target_compile_options(melon3d PRIVATE $<$<CONFIG:Release>:/arch:AVX2>)
+	endif()
+else()
 	target_compile_options(melon3d PRIVATE -Wall -Wextra)
-	# let the compiler use wide SIMD and FMA on the solver math
-	target_compile_options(melon3d PRIVATE $<$<CONFIG:Release>:-O3 -mavx2 -mfma>)
+	target_compile_options(melon3d PRIVATE $<$<CONFIG:Release>:-O3>)
+	if(MELON3D_X86)
+		target_compile_options(melon3d PRIVATE $<$<CONFIG:Release>:-mavx2 -mfma>)
+	endif()
 endif()
 
 find_package(Threads REQUIRED)
