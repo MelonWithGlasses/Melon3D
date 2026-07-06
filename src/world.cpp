@@ -7,7 +7,6 @@
 #include <chrono>
 #include <float.h>
 #include <string.h>
-#include <unordered_set>
 
 #if defined(_MSC_VER)
 #include <intrin.h>
@@ -262,9 +261,10 @@ ThreadPool::~ThreadPool()
 void ThreadPool::RunChunks()
 {
 	// Safe against stale wakeups: a chunk is only claimed via m_next, and a
-	// finished job has m_next >= m_count, so the (possibly dangling) fn
-	// pointer of an old job is never invoked.
-	const std::function<void(int32_t)>* fn = m_fn;
+	// finished job has m_next >= m_count, so the (possibly dangling) thunk
+	// of an old job is never invoked.
+	void (*thunk)(void*, int32_t) = m_thunk;
+	void* ctx = m_ctx;
 	int32_t count = m_count;
 	int32_t grain = m_grain;
 	for (;;)
@@ -277,7 +277,7 @@ void ThreadPool::RunChunks()
 		int32_t end = begin + grain < count ? begin + grain : count;
 		for (int32_t i = begin; i < end; ++i)
 		{
-			(*fn)(i);
+			thunk(ctx, i);
 		}
 	}
 }
@@ -340,25 +340,14 @@ void ThreadPool::WorkerLoop()
 	}
 }
 
-void ThreadPool::ParallelFor(int32_t count, int32_t grain, const std::function<void(int32_t)>& fn)
+void ThreadPool::Dispatch(int32_t count, int32_t grain, void (*thunk)(void*, int32_t), void* ctx)
 {
-	if (count <= 0)
-	{
-		return;
-	}
-	if (m_threads.empty() || count <= grain)
-	{
-		for (int32_t i = 0; i < count; ++i)
-		{
-			fn(i);
-		}
-		return;
-	}
-
-	// publish under the mutex; discovery is the lock-free jobId bump
+	// count > grain and workers exist (checked by the ParallelFor template);
+	// publish under the mutex, discovery is the lock-free jobId bump
 	{
 		std::lock_guard<std::mutex> lock(m_mutex);
-		m_fn = &fn;
+		m_thunk = thunk;
+		m_ctx = ctx;
 		m_count = count;
 		m_grain = grain > 0 ? grain : 1;
 		m_next.store(0, std::memory_order_relaxed);
@@ -549,6 +538,7 @@ void m3d_body_destroy(m3d_world* world, m3d_body_id id)
 			j.inUse = false;
 			j.generation++;
 			world->freeJoints.push_back(i);
+			world->jointedPairsDirty = true;
 		}
 	}
 
@@ -704,6 +694,7 @@ static m3d_joint_id AllocateJoint(m3d_world* world, Joint** out)
 	j = Joint();
 	j.generation = gen;
 	j.inUse = true;
+	world->jointedPairsDirty = true;
 	*out = &j;
 	return { index, gen };
 }
@@ -778,6 +769,7 @@ void m3d_joint_destroy(m3d_world* world, m3d_joint_id id)
 	j.inUse = false;
 	j.generation++;
 	world->freeJoints.push_back(id.index);
+	world->jointedPairsDirty = true;
 }
 
 // ---------------------------------------------------------------------------
@@ -944,16 +936,23 @@ void m3d_world_step(m3d_world* world, float dt, int substepCount)
 	// --- broadphase: rebuild the hash grid over expanded AABBs ---------------
 	RefreshBroadphase(world, dt);
 
-	// pairs connected by a joint do not collide
-	std::unordered_set<uint64_t> jointedPairs;
-	for (const Joint& j : world->joints)
+	// pairs connected by a joint do not collide. Rebuilt only when a joint
+	// is created/destroyed; a sorted vector is cheaper to scan than a set.
+	std::vector<uint64_t>& jointedPairs = world->jointedPairs;
+	if (world->jointedPairsDirty)
 	{
-		if (j.inUse)
+		jointedPairs.clear();
+		for (const Joint& j : world->joints)
 		{
-			int32_t lo = j.bodyA < j.bodyB ? j.bodyA : j.bodyB;
-			int32_t hi = j.bodyA < j.bodyB ? j.bodyB : j.bodyA;
-			jointedPairs.insert(ContactKey(lo, hi));
+			if (j.inUse)
+			{
+				int32_t lo = j.bodyA < j.bodyB ? j.bodyA : j.bodyB;
+				int32_t hi = j.bodyA < j.bodyB ? j.bodyB : j.bodyA;
+				jointedPairs.push_back(ContactKey(lo, hi));
+			}
 		}
+		std::sort(jointedPairs.begin(), jointedPairs.end());
+		world->jointedPairsDirty = false;
 	}
 	const bool haveJoints = !jointedPairs.empty();
 
@@ -988,7 +987,11 @@ void m3d_world_step(m3d_world* world, float dt, int substepCount)
 			return;
 		}
 		uint64_t key = ContactKey(lo, hi);
-		if (world->contactMap.count(key) != 0 || (haveJoints && jointedPairs.count(key) != 0))
+		if (world->contactMap.count(key) != 0)
+		{
+			return;
+		}
+		if (haveJoints && std::binary_search(jointedPairs.begin(), jointedPairs.end(), key))
 		{
 			return;
 		}
@@ -1010,7 +1013,8 @@ void m3d_world_step(m3d_world* world, float dt, int substepCount)
 	// parallel read-only scan, then serial removal in descending index order
 	{
 		const int32_t scanCount = (int32_t)world->contacts.size();
-		std::vector<uint8_t> removeFlag(scanCount, 0);
+		std::vector<uint8_t>& removeFlag = world->removeFlag;
+		removeFlag.assign(scanCount, 0);
 		world->pool->ParallelFor(scanCount, 512, [&](int32_t i) {
 			Contact& c = world->contacts[i];
 			Body& a = world->bodies[c.bodyA];
@@ -1044,7 +1048,8 @@ void m3d_world_step(m3d_world* world, float dt, int substepCount)
 	// cached-manifold steps cost ~30ns per contact: waking workers for that is
 	// slower than doing it inline. Last step's regeneration count is the gate.
 	const int32_t contactCount = (int32_t)world->contacts.size();
-	std::vector<int8_t> transition(contactCount, 0);
+	std::vector<int8_t>& transition = world->transition;
+	transition.assign(contactCount, 0);
 	std::atomic<int32_t> regenCount{ 0 };
 
 	bool parallelNp = world->pool->WorkerCount() > 1 && world->lastNpRegenCount > 256;
@@ -1131,7 +1136,8 @@ void m3d_world_step(m3d_world* world, float dt, int substepCount)
 	auto tNarrow = Clock::now();
 
 	// --- islands via union-find over dynamic bodies ----------------------------
-	std::vector<int32_t> parent(bodyCapacity);
+	std::vector<int32_t>& parent = world->parent;
+	parent.resize(bodyCapacity);
 	for (int32_t i = 0; i < bodyCapacity; ++i)
 	{
 		parent[i] = i;
@@ -1172,12 +1178,29 @@ void m3d_world_step(m3d_world* world, float dt, int substepCount)
 		}
 	}
 
-	std::vector<int32_t> islandIndex(bodyCapacity, -1);
-	world->islandBodies.clear();
-	world->islandContacts.clear();
-	world->islandJoints.clear();
+	std::vector<int32_t>& islandIndex = world->islandIndex;
+	islandIndex.assign(bodyCapacity, -1);
+	// reuse inner island vectors (clear keeps their capacity); islandUsed is
+	// the live count, so no vector<vector> free/realloc churn each step
+	world->islandUsed = 0;
 
-	std::vector<bool> islandAwake;
+	std::vector<uint8_t>& islandAwake = world->islandAwake;
+	islandAwake.clear();
+	auto ensureIsland = [&]() -> int32_t {
+		int32_t idx = world->islandUsed++;
+		if (idx >= (int32_t)world->islandBodies.size())
+		{
+			world->islandBodies.emplace_back();
+			world->islandContacts.emplace_back();
+			world->islandJoints.emplace_back();
+		}
+		world->islandBodies[idx].clear();
+		world->islandContacts[idx].clear();
+		world->islandJoints[idx].clear();
+		islandAwake.push_back(0);
+		return idx;
+	};
+
 	for (int32_t i = 0; i < bodyCapacity; ++i)
 	{
 		Body& b = world->bodies[i];
@@ -1188,21 +1211,17 @@ void m3d_world_step(m3d_world* world, float dt, int substepCount)
 		int32_t root = find(i);
 		if (islandIndex[root] < 0)
 		{
-			islandIndex[root] = (int32_t)world->islandBodies.size();
-			world->islandBodies.emplace_back();
-			world->islandContacts.emplace_back();
-			world->islandJoints.emplace_back();
-			islandAwake.push_back(false);
+			islandIndex[root] = ensureIsland();
 		}
 		int32_t idx = islandIndex[root];
 		world->islandBodies[idx].push_back(i);
 		if (b.isAwake)
 		{
-			islandAwake[idx] = true;
+			islandAwake[idx] = 1;
 		}
 	}
 
-	const int32_t islandCount = (int32_t)world->islandBodies.size();
+	const int32_t islandCount = world->islandUsed;
 	for (int32_t idx = 0; idx < islandCount; ++idx)
 	{
 		if (!islandAwake[idx])
@@ -1254,7 +1273,8 @@ void m3d_world_step(m3d_world* world, float dt, int substepCount)
 	}
 
 	// --- solve islands in parallel (islands touch disjoint dynamic bodies) ----
-	std::vector<int32_t> awakeIslands;
+	std::vector<int32_t>& awakeIslands = world->awakeIslands;
+	awakeIslands.clear();
 	for (int32_t idx = 0; idx < islandCount; ++idx)
 	{
 		if (islandAwake[idx])
@@ -1270,8 +1290,8 @@ void m3d_world_step(m3d_world* world, float dt, int substepCount)
 	// parallelizes INSIDE the island. The colored path is chosen by island
 	// size only (never by thread count), so results stay bit-identical for
 	// any workerCount: within a color bodies are disjoint.
-	std::vector<int32_t> smallIslands;
-	smallIslands.reserve(awakeIslands.size());
+	std::vector<int32_t>& smallIslands = world->smallIslands;
+	smallIslands.clear();
 	for (int32_t idx : awakeIslands)
 	{
 		if ((int32_t)world->islandContacts[idx].size() >= kBigIslandContacts)

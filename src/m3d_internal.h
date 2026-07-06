@@ -15,9 +15,9 @@
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
-#include <functional>
 #include <mutex>
 #include <thread>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -439,16 +439,41 @@ struct alignas(32) ContactPacket8
 // step; a condition-variable handoff (~10us) would eat the gains, so jobs
 // are published with a release store of the job id and hot workers pick
 // them up from a bounded spin loop (~1us per stage barrier).
+//
+// ParallelFor is a template: the functor is passed as a raw thunk + context
+// pointer instead of a std::function, so dispatching a stage performs zero
+// heap allocations (the caller's closure outlives the job by construction:
+// Dispatch does not return until the job is retired and drained).
 class ThreadPool
 {
 public:
 	explicit ThreadPool(int32_t workerCount);
 	~ThreadPool();
 
-	void ParallelFor(int32_t count, int32_t grain, const std::function<void(int32_t)>& fn);
+	template <typename F>
+	void ParallelFor(int32_t count, int32_t grain, F&& fn)
+	{
+		if (count <= 0)
+		{
+			return;
+		}
+		if (m_threads.empty() || count <= grain)
+		{
+			for (int32_t i = 0; i < count; ++i)
+			{
+				fn(i);
+			}
+			return;
+		}
+		using Fn = typename std::remove_reference<F>::type;
+		Dispatch(count, grain, [](void* ctx, int32_t i) { (*static_cast<Fn*>(ctx))(i); },
+				 const_cast<void*>(static_cast<const void*>(&fn)));
+	}
+
 	int32_t WorkerCount() const { return (int32_t)m_threads.size() + 1; }
 
 private:
+	void Dispatch(int32_t count, int32_t grain, void (*thunk)(void*, int32_t), void* ctx);
 	void WorkerLoop();
 	void RunChunks();
 
@@ -458,7 +483,8 @@ private:
 
 	// job slot: stable while m_jobOpen; workers enter under the mutex, so a
 	// straggler can never observe a half-published or retired job
-	const std::function<void(int32_t)>* m_fn = nullptr;
+	void (*m_thunk)(void*, int32_t) = nullptr;
+	void* m_ctx = nullptr;
 	int32_t m_count = 0;
 	int32_t m_grain = 1;
 	bool m_jobOpen = false; // guarded by m_mutex
@@ -512,10 +538,25 @@ struct m3d_world
 
 	m3d::ThreadPool* pool;
 
-	// solver scratch
+	// --- per-step scratch (reused across steps to avoid heap churn) ----------
+	std::vector<uint8_t> removeFlag;     // contacts to drop this step
+	std::vector<int8_t> transition;      // per-contact touch begin/end
+	std::vector<int32_t> parent;         // union-find
+	std::vector<int32_t> islandIndex;    // find-root -> island slot
+	std::vector<uint8_t> islandAwake;
+	std::vector<int32_t> awakeIslands;
+	std::vector<int32_t> smallIslands;
+
+	// joint-pair exclusion set, rebuilt only when a joint is created/destroyed
+	std::vector<uint64_t> jointedPairs; // sorted
+	bool jointedPairsDirty = true;
+
+	// solver scratch. Inner vectors are reused (only cleared, never freed):
+	// islandUsed tracks how many are live this step.
 	std::vector<std::vector<int32_t>> islandContacts;
 	std::vector<std::vector<int32_t>> islandJoints;
 	std::vector<std::vector<int32_t>> islandBodies;
+	int32_t islandUsed = 0;
 
 	// graph coloring scratch (big islands are colored one at a time)
 	std::vector<uint32_t> colorMask; // per body: colors already used

@@ -416,13 +416,19 @@ void SolveIslandXPBD(m3d_world* world, const std::vector<int32_t>& bodyIndices,
 	float gravityLen = m3d_length(gravity);
 	int32_t positionIterations = world->def.positionIterations > 0 ? world->def.positionIterations : 2;
 
-	for (int32_t bi : bodyIndices)
+	// PrepareJoint reads invInertiaWorld, so refresh it up front only when the
+	// island actually has joints; otherwise the first IntegrateBodySubstep
+	// refreshes it (avoids a redundant R*I*R^T per body per step).
+	if (!jointIndices.empty())
 	{
-		UpdateInvInertiaWorld(world->bodies[bi]);
-	}
-	for (int32_t ji : jointIndices)
-	{
-		PrepareJoint(world, world->joints[ji]);
+		for (int32_t bi : bodyIndices)
+		{
+			UpdateInvInertiaWorld(world->bodies[bi]);
+		}
+		for (int32_t ji : jointIndices)
+		{
+			PrepareJoint(world, world->joints[ji]);
+		}
 	}
 
 	for (int sub = 0; sub < substepCount; ++sub)
@@ -735,10 +741,15 @@ void SolveIslandColoredXPBD(m3d_world* world, const std::vector<int32_t>& bodyIn
 	const int32_t bodyCount = (int32_t)bodyIndices.size();
 	const int32_t contactCount = (int32_t)contactIndices.size();
 
-	pool->ParallelFor(bodyCount, 128, [&](int32_t k) { UpdateInvInertiaWorld(world->bodies[bodyIndices[k]]); });
-	for (int32_t ji : jointIndices)
+	// only needed up front when joints read invInertiaWorld before the first
+	// integrate; big islands are usually joint-free, so this skips a full pass
+	if (!jointIndices.empty())
 	{
-		PrepareJoint(world, world->joints[ji]);
+		pool->ParallelFor(bodyCount, 128, [&](int32_t k) { UpdateInvInertiaWorld(world->bodies[bodyIndices[k]]); });
+		for (int32_t ji : jointIndices)
+		{
+			PrepareJoint(world, world->joints[ji]);
+		}
 	}
 
 	if ((int32_t)world->colorPackets.size() < kMaxGraphColors)
