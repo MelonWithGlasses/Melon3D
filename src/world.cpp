@@ -106,8 +106,14 @@ void RemoveContactAt(m3d_world* world, int32_t index)
 	{
 		world->contacts[index] = world->contacts[last];
 		world->contactMap[world->contacts[index].key] = index;
+		world->cBodyA[index] = world->cBodyA[last];
+		world->cBodyB[index] = world->cBodyB[last];
+		world->cTouching[index] = world->cTouching[last];
 	}
 	world->contacts.pop_back();
+	world->cBodyA.pop_back();
+	world->cBodyB.pop_back();
+	world->cTouching.pop_back();
 }
 
 void WakeBodyInternal(m3d_world* world, int32_t index)
@@ -124,6 +130,11 @@ void WakeBodyInternal(m3d_world* world, int32_t index)
 	b.isAwake = true;
 	b.sleepTime = 0.0f;
 	b.smoothedEnergy = 4.0f * kSleepEnergyThresh; // woken: restart the settle clock
+	// keep the hot sidecar's awake bit consistent for in-step wakes
+	if (index < (int32_t)world->bFlags.size())
+	{
+		world->bFlags[index] |= kBFlagAwake;
+	}
 }
 
 // expanded AABB: shape AABB + margin + directional velocity extension
@@ -149,6 +160,7 @@ void RefreshBroadphase(m3d_world* world, float dt)
 	world->inStableTier.resize(n, 0);
 	world->hasFatAABB.resize(n, 0);
 	world->movedFlag.resize(n, 0);
+	world->bFlags.resize(n, 0);
 
 	// stable rebuilds are coalesced: fresh sleepers keep riding the active
 	// tier for a few steps so sleep/wake churn does not rebuild the stable
@@ -161,6 +173,10 @@ void RefreshBroadphase(m3d_world* world, float dt)
 		world->isActiveBody[i] = active ? 1 : 0;
 		world->isStableBody[i] = stable ? 1 : 0;
 		world->movedFlag[i] = 0;
+		world->bFlags[i] = (uint8_t)((b.inUse ? kBFlagInUse : 0) |
+									 ((b.inUse && b.type == M3D_BODY_DYNAMIC) ? kBFlagDynamic : 0) |
+									 ((b.inUse && b.type == M3D_BODY_KINEMATIC) ? kBFlagKinematic : 0) |
+									 (b.isAwake ? kBFlagAwake : 0));
 		if (active)
 		{
 			// fat AABB persists until the ONE-STEP-AHEAD prediction breaches it;
@@ -1007,6 +1023,9 @@ void m3d_world_step(m3d_world* world, float dt, int substepCount)
 		c.hasCache = false;
 		world->contactMap[key] = (int32_t)world->contacts.size();
 		world->contacts.push_back(c);
+		world->cBodyA.push_back(lo);
+		world->cBodyB.push_back(hi);
+		world->cTouching.push_back(0);
 	});
 
 	// --- destroy contacts whose expanded AABBs separated ----------------------
@@ -1016,14 +1035,12 @@ void m3d_world_step(m3d_world* world, float dt, int substepCount)
 		std::vector<uint8_t>& removeFlag = world->removeFlag;
 		removeFlag.assign(scanCount, 0);
 		world->pool->ParallelFor(scanCount, 512, [&](int32_t i) {
-			Contact& c = world->contacts[i];
-			Body& a = world->bodies[c.bodyA];
-			Body& b = world->bodies[c.bodyB];
-			if (!a.isAwake && !b.isAwake)
+			int32_t ba = world->cBodyA[i], bb = world->cBodyB[i];
+			if (!(world->bFlags[ba] & kBFlagAwake) && !(world->bFlags[bb] & kBFlagAwake))
 			{
 				return;
 			}
-			if (!m3d_aabb_overlap(world->expandedAABBs[c.bodyA], world->expandedAABBs[c.bodyB]))
+			if (!m3d_aabb_overlap(world->expandedAABBs[ba], world->expandedAABBs[bb]))
 			{
 				removeFlag[i] = 1;
 			}
@@ -1060,13 +1077,15 @@ void m3d_world_step(m3d_world* world, float dt, int substepCount)
 		npGrain = contactCount + 1; // forces the inline path
 	}
 	world->pool->ParallelFor(contactCount, npGrain, [&](int32_t i) {
-		Contact& c = world->contacts[i];
-		Body& a = world->bodies[c.bodyA];
-		Body& b = world->bodies[c.bodyB];
-		if (!a.isAwake && !b.isAwake)
+		// cheap sidecar skip: sleeping pairs never load the 680-byte Contact
+		if (!(world->bFlags[world->cBodyA[i]] & kBFlagAwake) &&
+			!(world->bFlags[world->cBodyB[i]] & kBFlagAwake))
 		{
 			return;
 		}
+		Contact& c = world->contacts[i];
+		Body& a = world->bodies[c.bodyA];
+		Body& b = world->bodies[c.bodyB];
 
 		// reuse the cached manifold while neither body has moved
 		if (!c.hasCache || PoseChanged(a, c.cachePosA, c.cacheRotA) || PoseChanged(b, c.cachePosB, c.cacheRotB))
@@ -1095,6 +1114,7 @@ void m3d_world_step(m3d_world* world, float dt, int substepCount)
 
 		bool wasTouching = c.touching;
 		c.touching = c.manifold.pointCount > 0;
+		world->cTouching[i] = c.touching ? 1 : 0;
 		if (c.touching && !wasTouching)
 		{
 			transition[i] = 1;
@@ -1135,6 +1155,25 @@ void m3d_world_step(m3d_world* world, float dt, int substepCount)
 	}
 	auto tNarrow = Clock::now();
 
+	// Early-out: if nothing dynamic is awake, there is no island to build,
+	// nothing to solve, and no sleep transition. A fully-settled world then
+	// costs only the (sidecar-cheap) broadphase + narrowphase skip passes,
+	// making large sleeping scenes effectively free. Kinematic bodies are
+	// handled below regardless.
+	bool anyAwakeDynamic = false;
+	for (int32_t i = 0; i < bodyCapacity; ++i)
+	{
+		if ((world->bFlags[i] & (kBFlagDynamic | kBFlagAwake)) == (kBFlagDynamic | kBFlagAwake))
+		{
+			anyAwakeDynamic = true;
+			break;
+		}
+	}
+
+	int32_t islandCount = 0;
+	int32_t touchingCount = 0;
+	if (anyAwakeDynamic)
+	{
 	// --- islands via union-find over dynamic bodies ----------------------------
 	std::vector<int32_t>& parent = world->parent;
 	parent.resize(bodyCapacity);
@@ -1159,15 +1198,20 @@ void m3d_world_step(m3d_world* world, float dt, int substepCount)
 		}
 	};
 
-	for (const Contact& c : world->contacts)
+	// union over touching dynamic-dynamic pairs, read from the hot sidecar
+	// (9 bytes/contact instead of loading the 680-byte Contact). Full union
+	// is kept so multi-hop wake propagation stays exact.
+	const int32_t contactTotal = (int32_t)world->contacts.size();
+	for (int32_t i = 0; i < contactTotal; ++i)
 	{
-		if (!c.touching)
+		if (!world->cTouching[i])
 		{
 			continue;
 		}
-		if (world->bodies[c.bodyA].type == M3D_BODY_DYNAMIC && world->bodies[c.bodyB].type == M3D_BODY_DYNAMIC)
+		int32_t ba = world->cBodyA[i], bb = world->cBodyB[i];
+		if ((world->bFlags[ba] & kBFlagDynamic) && (world->bFlags[bb] & kBFlagDynamic))
 		{
-			unite(c.bodyA, c.bodyB);
+			unite(ba, bb);
 		}
 	}
 	for (const Joint& j : world->joints)
@@ -1203,8 +1247,8 @@ void m3d_world_step(m3d_world* world, float dt, int substepCount)
 
 	for (int32_t i = 0; i < bodyCapacity; ++i)
 	{
-		Body& b = world->bodies[i];
-		if (!b.inUse || b.type != M3D_BODY_DYNAMIC)
+		uint8_t f = world->bFlags[i];
+		if (!(f & kBFlagDynamic))
 		{
 			continue;
 		}
@@ -1215,13 +1259,13 @@ void m3d_world_step(m3d_world* world, float dt, int substepCount)
 		}
 		int32_t idx = islandIndex[root];
 		world->islandBodies[idx].push_back(i);
-		if (b.isAwake)
+		if (f & kBFlagAwake)
 		{
 			islandAwake[idx] = 1;
 		}
 	}
 
-	const int32_t islandCount = world->islandUsed;
+	islandCount = world->islandUsed;
 	for (int32_t idx = 0; idx < islandCount; ++idx)
 	{
 		if (!islandAwake[idx])
@@ -1237,16 +1281,15 @@ void m3d_world_step(m3d_world* world, float dt, int substepCount)
 		}
 	}
 
-	int32_t touchingCount = 0;
-	for (int32_t i = 0; i < (int32_t)world->contacts.size(); ++i)
+	for (int32_t i = 0; i < contactTotal; ++i)
 	{
-		Contact& c = world->contacts[i];
-		if (!c.touching)
+		if (!world->cTouching[i])
 		{
 			continue;
 		}
 		++touchingCount;
-		int32_t dynBody = world->bodies[c.bodyA].type == M3D_BODY_DYNAMIC ? c.bodyA : c.bodyB;
+		int32_t ba = world->cBodyA[i], bb = world->cBodyB[i];
+		int32_t dynBody = (world->bFlags[ba] & kBFlagDynamic) ? ba : bb;
 		int32_t idx = islandIndex[find(dynBody)];
 		if (idx >= 0 && islandAwake[idx])
 		{
@@ -1320,20 +1363,7 @@ void m3d_world_step(m3d_world* world, float dt, int substepCount)
 						substepCount);
 	});
 
-	// integrate kinematic bodies
-	for (int32_t i = 0; i < bodyCapacity; ++i)
-	{
-		Body& b = world->bodies[i];
-		if (!b.inUse || b.type != M3D_BODY_KINEMATIC || !b.isAwake)
-		{
-			continue;
-		}
-		b.position = m3d_mul_add(b.position, dt, b.linearVelocity);
-		b.rotation = m3d_quat_integrate(b.rotation, b.angularVelocity, dt);
-	}
-
 	// --- sleeping ---------------------------------------------------------------
-	int32_t awakeBodyCount = 0;
 	for (int32_t idx : awakeIslands)
 	{
 		float minSleepTime = FLT_MAX;
@@ -1370,21 +1400,39 @@ void m3d_world_step(m3d_world* world, float dt, int substepCount)
 				b.isAwake = false;
 				b.linearVelocity = m3d_v3_zero();
 				b.angularVelocity = m3d_v3_zero();
+				world->bFlags[bi] &= (uint8_t)~kBFlagAwake; // keep sidecar in sync
 			}
 			world->stableDirty = true;
 		}
 	}
+	} // end if (anyAwakeDynamic)
 
-	int32_t bodyCount = 0;
+	// integrate kinematic bodies unconditionally (sidecar-gated: a 1-byte read
+	// skips all dynamic/static/free slots without loading each Body)
 	for (int32_t i = 0; i < bodyCapacity; ++i)
 	{
+		uint8_t f = world->bFlags[i];
+		if (!(f & kBFlagKinematic) || !(f & kBFlagAwake))
+		{
+			continue;
+		}
 		Body& b = world->bodies[i];
-		if (!b.inUse)
+		b.position = m3d_mul_add(b.position, dt, b.linearVelocity);
+		b.rotation = m3d_quat_integrate(b.rotation, b.angularVelocity, dt);
+	}
+
+	// bodyCount/awakeBodyCount are profiling-only; iterate the 1-byte sidecar
+	int32_t bodyCount = 0;
+	int32_t awakeBodyCount = 0;
+	for (int32_t i = 0; i < bodyCapacity; ++i)
+	{
+		uint8_t f = world->bFlags[i];
+		if (!(f & kBFlagInUse))
 		{
 			continue;
 		}
 		++bodyCount;
-		if (b.isAwake)
+		if (f & kBFlagAwake)
 		{
 			++awakeBodyCount;
 		}

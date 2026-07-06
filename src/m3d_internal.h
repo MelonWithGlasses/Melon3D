@@ -212,6 +212,12 @@ inline uint64_t ContactKey(int32_t a, int32_t b)
 	return ((uint64_t)(uint32_t)a << 32) | (uint32_t)b;
 }
 
+// body sidecar flag bits (see m3d_world::bFlags)
+constexpr uint8_t kBFlagDynamic = 1; // in use AND dynamic
+constexpr uint8_t kBFlagAwake = 2;
+constexpr uint8_t kBFlagInUse = 4;
+constexpr uint8_t kBFlagKinematic = 8; // in use AND kinematic
+
 // index of the lowest set bit; caller guarantees v != 0
 inline int32_t CountTrailingZeros32(uint32_t v)
 {
@@ -514,6 +520,12 @@ struct m3d_world
 
 	std::vector<m3d::Contact> contacts;
 	std::unordered_map<uint64_t, int32_t> contactMap;
+	// Hot sidecar parallel to `contacts`: the island/union-find scans read
+	// only these 9 bytes/contact instead of loading the 680-byte Contact
+	// (with its inline manifold), so sleeping piles are nearly free to skip.
+	std::vector<int32_t> cBodyA;
+	std::vector<int32_t> cBodyB;
+	std::vector<uint8_t> cTouching;
 
 	m3d::SpatialGrid grid;
 	bool gridDirty = true;
@@ -526,6 +538,11 @@ struct m3d_world
 	std::vector<uint8_t> isStableBody;
 	std::vector<uint8_t> hasFatAABB; // fat AABB valid for this body slot
 	std::vector<uint8_t> movedFlag;  // breached its fat AABB this step -> re-pair
+	// Hot body sidecar for the serial island scans: bit0 dynamic+inUse,
+	// bit1 awake. Snapshotted in the broadphase parallel pass and updated
+	// at the few in-step wake sites, so island building never loads the
+	// 232-byte Body just to read two flags.
+	std::vector<uint8_t> bFlags;
 	int32_t lastNpRegenCount = 1 << 30; // manifold regens last step; gates parallel narrowphase
 	std::vector<uint8_t> inStableTier; // migrated into the stable tier at its last build
 	std::vector<uint32_t> rayStamps; // per-body visited stamp for ray casts
