@@ -307,10 +307,19 @@ static void CollideCapsuleBox(const Shape& a, m3d_transform xfA, const Shape& b,
 	m3d_vec3 segB = m3d_inv_transform_point(xfB, m3d_add(xfA.p, axis));
 	m3d_vec3 segDir = m3d_sub(segB, segA);
 
-	// Distance from a convex set along the segment is convex in t: ternary search.
+	// Distance from a convex set along the segment is convex in t: ternary
+	// search. Each iteration shrinks the bracket by 2/3, so ~22 iterations
+	// reach (2/3)^22 ~ 4e-4 of the segment length; stop early once the
+	// bracket is under the linear slop scaled to the segment.
 	float lo = 0.0f, hi = 1.0f;
-	for (int i = 0; i < 40; ++i)
+	float segLen2 = m3d_length_sq(segDir);
+	float tol = segLen2 > 1e-12f ? (kLinearSlop * kLinearSlop) / segLen2 : 1e-6f;
+	for (int i = 0; i < 22; ++i)
 	{
+		if ((hi - lo) * (hi - lo) < tol)
+		{
+			break;
+		}
 		float t1 = lo + (hi - lo) / 3.0f;
 		float t2 = hi - (hi - lo) / 3.0f;
 		float d1 = PointBoxDistSq(m3d_mul_add(segA, t1, segDir), e);
