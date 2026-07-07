@@ -53,6 +53,8 @@ premium on piles that settle and sleep. Honest numbers below.
   - per-substep frozen effective masses and angular Jacobians
   - depenetration capped at 3 m/s; separate restitution/dynamic-friction
     velocity pass
+  - **rolling resistance** for spheres/capsules so piles settle instead of
+    rolling forever (per-shape, default on)
 - **Islands & sleeping**: union-find islands, whole-island sleep/wake
 - **Big-island parallelism**: islands with 300+ contacts are solved with
   **graph coloring** — contacts bucketed so no two in a bucket share a
