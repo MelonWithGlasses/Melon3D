@@ -139,11 +139,11 @@ both engines can also be compared 1T vs 1T.
 
 | Scene | box3d 1T | Melon3D 1T | Melon3D 16T |
 |---|---|---|---|
-| **churn** — 1500 bodies raining, 25 destroyed+respawned each step | 1.256 (2.14) | 1.33 (2.26) | **0.881 (1.55)** |
-| **rain** — 1000 mixed spheres/capsules/boxes falling | **0.965** (2.01) | 1.65 (5.06) | 1.124 (5.90) |
-| **stacks** — 8×8 grid of 6-box towers (384 bodies) | **0.046** (0.90) | 0.214 (1.89) | **0.048** (0.78) |
-| **towers** — 20×20 grid of 3-box towers (1200 bodies) | **0.143** (2.87) | 0.712 (7.16) | 0.168 (2.35) |
-| **pyramid** — 210-box pyramid, one contact island | **0.122** (1.44) | 0.382 (2.45) | 0.398 (2.49) |
+| **churn** — 1500 bodies raining, 25 destroyed+respawned each step | 1.262 (2.04) | 1.10 (1.89) | **0.714 (1.38)** |
+| **rain** — 1000 mixed spheres/capsules/boxes falling | 1.010 (2.17) | 1.21 (3.56) | **0.862 (4.70)** |
+| **stacks** — 8×8 grid of 6-box towers (384 bodies) | 0.046 (0.90) | 0.212 (1.82) | **0.045 (0.68)** |
+| **towers** — 20×20 grid of 3-box towers (1200 bodies) | 0.144 (3.02) | 0.635 (5.57) | **0.142 (2.28)** |
+| **pyramid** — 210-box pyramid, one contact island | **0.123** (1.66) | 0.340 (2.00) | 0.358 (2.41) |
 
 Fixed per-step cost of a fully-settled (asleep) scene, Melon3D 8 threads —
 a scaling metric, not a box3d comparison: 2400 boxes ≈ 0.08 ms, 8000
@@ -183,21 +183,17 @@ the summary table reflects current numbers, which are equal or better.)
 
 ### Reading the numbers
 
-- **Streaming (churn)**: Melon3D 16T is ~30% faster on average than box3d
-  1T, and ~27% better on the worst frame. With constant create/destroy
-  there is no warm-start state to rebuild, the hash grid is indifferent to
-  body lifetime, and stage dispatch is allocation-free — this is the
-  workload the architecture was shaped for (debris, projectiles, casings).
-- **Stacks**: at parity (0.048 vs 0.046).
-- **Rain**: box3d ~1.15× faster on average.
-- **Settle-and-sleep scenes (towers, pyramid)**: box3d is 1.2–3.3× faster
-  on average. Two measured factors: its warm-started solver drives
-  residual velocities below the sleep threshold by roughly step 25 where
-  Melon3D's position-reconstructed velocities take until roughly step 60
-  (sleeping piles cost nothing, so the shorter settle window dominates the
-  average), and its hand-packed SIMD constraint solver does more work per
-  cycle. Melon3D's awake-step cost on the pyramid is within ~1.4× of
-  box3d — most of the remaining average gap is settle time.
+- **Melon3D 16T is at or ahead of box3d 1T on four of five scenes**
+  (churn, rain, stacks, towers). Streaming churn is ~43% faster and rain
+  ~15% faster; stacks and towers are at parity. These are the workloads
+  the architecture was shaped for: allocation-free stage dispatch, a hash
+  grid indifferent to body lifetime, no warm-start state to rebuild, and
+  per-step (not per-substep) collision.
+- **Pyramid** (one big contact island) is box3d's, ~2.9× on average. It is
+  dominated by *settle time*, not step speed: box3d's warm-started solver
+  drives residual velocities below the sleep threshold in fewer frames, so
+  the pile sleeps sooner. Melon3D's awake-step cost is close; the gap is
+  how long the single island stays awake.
 - **Large sleeping scenes**: the per-step cost of a fully-settled scene is
   a few compact array scans, so tens of thousands of at-rest bodies stay
   affordable (see the fixed-cost figures above).
