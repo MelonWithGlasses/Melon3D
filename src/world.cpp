@@ -433,6 +433,7 @@ m3d_shape_def m3d_shape_def_default(void)
 	def.density = 1000.0f;
 	def.friction = 0.6f;
 	def.restitution = 0.0f;
+	def.rollingResistance = 0.02f;
 	return def;
 }
 
@@ -508,6 +509,7 @@ m3d_body_id m3d_body_create(m3d_world* world, const m3d_body_def* bodyDef, const
 	b.shape.halfExtents = shapeDef->halfExtents;
 	b.friction = shapeDef->friction;
 	b.restitution = shapeDef->restitution;
+	b.rollingResistance = shapeDef->rollingResistance;
 
 	ComputeMassProperties(b, shapeDef);
 	UpdateInvInertiaWorld(b);
@@ -1019,6 +1021,7 @@ void m3d_world_step(m3d_world* world, float dt, int substepCount)
 		c.manifold.normal = m3d_v3(0.0f, 1.0f, 0.0f);
 		c.friction = sqrtf(lb.friction * hb.friction);
 		c.restitution = lb.restitution > hb.restitution ? lb.restitution : hb.restitution;
+		c.rollingResistance = sqrtf(lb.rollingResistance * hb.rollingResistance);
 		c.touching = false;
 		c.hasCache = false;
 		world->contactMap[key] = (int32_t)world->contacts.size();

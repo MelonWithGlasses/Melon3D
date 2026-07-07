@@ -278,6 +278,13 @@ typedef struct m3d_shape_def
 	float density;	   // kg/m^3
 	float friction;	   // Coulomb friction coefficient
 	float restitution; // bounciness [0,1]
+	// Rolling resistance [0,1]. Damps rolling of spheres and capsules so
+	// piles settle instead of rolling forever on their point/line contacts
+	// (and so bodies do not slowly squeeze through the floor). Has little
+	// effect on boxes (flat contacts do not roll). Default 0.02 - enough to
+	// settle piles while balls still roll freely; raise for stickier piles,
+	// lower (or 0) for marble/bowling-style free rolling.
+	float rollingResistance;
 } m3d_shape_def;
 
 typedef struct m3d_body_def

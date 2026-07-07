@@ -89,6 +89,7 @@ struct Body
 	Shape shape;
 	float friction;
 	float restitution;
+	float rollingResistance;
 	float mass;
 
 	m3d_body_type type;
@@ -183,6 +184,7 @@ struct Contact
 	Manifold manifold;
 	float friction;
 	float restitution;
+	float rollingResistance;
 	bool touching;
 
 	// Pose snapshot at manifold generation. While neither body has moved

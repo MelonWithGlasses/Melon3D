@@ -251,6 +251,34 @@ static void SolveContactVelocity(m3d_world* world, Contact& c, float h, float gr
 			ApplyAxisVelocity(b, j, n, mp.angJB);
 			ApplyAxisVelocity(a, -j, n, mp.angJA);
 		}
+
+		// Rolling resistance at this point: damp the relative angular velocity
+		// perpendicular to the normal (the rolling mode), limited by a budget
+		// proportional to the point's normal impulse (so it only acts under
+		// load, never in free flight). Without it a sphere/capsule keeps
+		// rolling - and the velocity-pass friction slowly pumps that roll - so
+		// piles never settle and some bodies eventually squeeze through the
+		// floor. Boxes have flat contacts and are essentially unaffected.
+		if (c.rollingResistance > 0.0f && mp.lambdaN > 0.0f)
+		{
+			m3d_vec3 wrel = m3d_sub(b.angularVelocity, a.angularVelocity);
+			m3d_vec3 wroll = m3d_sub(wrel, m3d_scale(m3d_dot(wrel, n), n)); // perp to normal
+			float wl = m3d_length(wroll);
+			if (wl > 1e-6f)
+			{
+				m3d_vec3 axis = m3d_scale(1.0f / wl, wroll);
+				float k = m3d_dot(axis, m3d_mat3_mulv(&a.invInertiaWorld, axis)) +
+						  m3d_dot(axis, m3d_mat3_mulv(&b.invInertiaWorld, axis));
+				if (k > 1e-12f)
+				{
+					float maxDw = c.rollingResistance * mp.lambdaN * invH * k;
+					float dw = maxDw < wl ? maxDw : wl; // brake only, never reverse
+					m3d_vec3 angImp = m3d_scale(dw / k, axis);
+					b.angularVelocity = m3d_sub(b.angularVelocity, m3d_mat3_mulv(&b.invInertiaWorld, angImp));
+					a.angularVelocity = m3d_add(a.angularVelocity, m3d_mat3_mulv(&a.invInertiaWorld, angImp));
+				}
+			}
+		}
 	}
 }
 
