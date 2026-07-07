@@ -345,16 +345,40 @@ static void IntegrateBodySubstep(m3d_world* world, int32_t bi, float h, m3d_vec3
 	UpdateInvInertiaWorld(body);
 }
 
-// narrowphase at current substep poses, cached while bodies are still:
-// resting contacts skip collision entirely and keep their anchors as
-// persistent stiction targets for static friction
+// Per-substep contact preparation. The manifold (points, normal,
+// separationOffset baseline, friction anchors) is generated ONCE per step by
+// the step-level narrowphase; here we only re-freeze the world-space anchor
+// offsets, effective mass and angular Jacobians for the current substep pose
+// and reset the per-substep accumulators. Separation is tracked through the
+// body-local anchors, so no re-collision is needed within the step.
+//
+// A safety re-collision fires only if a body has moved a large distance since
+// the manifold was generated (a fast body whose step-start manifold would be
+// stale); resting and slowly-settling contacts - the overwhelming majority -
+// reuse the manifold and pay collision only once per step.
+static inline bool ContactManifoldStale(const Body& a, const Body& b, const Contact& c)
+{
+	constexpr float kReCollidePosSq = 0.03f * 0.03f;  // 3 cm
+	constexpr float kReCollideHalfAngSq = 0.05f * 0.05f; // ~5.7 deg
+	if (m3d_length_sq(m3d_sub(a.position, c.cachePosA)) > kReCollidePosSq ||
+		m3d_length_sq(m3d_sub(b.position, c.cachePosB)) > kReCollidePosSq)
+	{
+		return true;
+	}
+	m3d_quat da = m3d_quat_mul(a.rotation, m3d_quat_conj(c.cacheRotA));
+	m3d_quat db = m3d_quat_mul(b.rotation, m3d_quat_conj(c.cacheRotB));
+	return da.x * da.x + da.y * da.y + da.z * da.z > kReCollideHalfAngSq ||
+		   db.x * db.x + db.y * db.y + db.z * db.z > kReCollideHalfAngSq;
+}
+
 static void PrepareContactSubstep(m3d_world* world, int32_t ci, float h)
 {
 	Contact& c = world->contacts[ci];
 	Body& a = world->bodies[c.bodyA];
 	Body& b = world->bodies[c.bodyB];
-	bool regen = !c.hasCache || PoseChanged(a, c.cachePosA, c.cacheRotA) || PoseChanged(b, c.cachePosB, c.cacheRotB);
-	if (regen)
+
+	// safety re-collision for fast bodies only (see note above)
+	if (!c.hasCache || ContactManifoldStale(a, b, c))
 	{
 		Manifold oldManifold = c.manifold;
 		float relSpeed = m3d_length(m3d_sub(a.linearVelocity, b.linearVelocity));
@@ -366,7 +390,17 @@ static void PrepareContactSubstep(m3d_world* world, int32_t ci, float h)
 		c.cacheRotA = a.rotation;
 		c.cachePosB = b.position;
 		c.cacheRotB = b.rotation;
+		m3d_vec3 nn = c.manifold.normal;
+		for (int32_t i = 0; i < c.manifold.pointCount; ++i)
+		{
+			ManifoldPoint& mp = c.manifold.points[i];
+			m3d_vec3 rA = m3d_rotate(a.rotation, mp.localAnchorA);
+			m3d_vec3 rB = m3d_rotate(b.rotation, mp.localAnchorB);
+			float ref = m3d_dot(m3d_sub(m3d_add(b.position, rB), m3d_add(a.position, rA)), nn);
+			mp.separationOffset = mp.separation - ref;
+		}
 	}
+
 	// freeze anchors, the normal mass and the angular Jacobians for this substep
 	m3d_vec3 n = c.manifold.normal;
 	for (int32_t i = 0; i < c.manifold.pointCount; ++i)
@@ -381,11 +415,6 @@ static void PrepareContactSubstep(m3d_world* world, int32_t ci, float h)
 		mp.angJA = m3d_mat3_mulv(&a.invInertiaWorld, crossA);
 		mp.angJB = m3d_mat3_mulv(&b.invInertiaWorld, crossB);
 		mp.wN = a.invMass + b.invMass + m3d_dot(crossA, mp.angJA) + m3d_dot(crossB, mp.angJB);
-		if (regen)
-		{
-			float ref = m3d_dot(m3d_sub(m3d_add(b.position, mp.rB), m3d_add(a.position, mp.rA)), n);
-			mp.separationOffset = mp.separation - ref;
-		}
 	}
 }
 
