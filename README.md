@@ -16,9 +16,10 @@ sensors · sleeping · ray & sphere casts · single-file build available
 
 ![Melon3D demo](docs/demo.gif)
 
-*A stable box pyramid struck by a fast projectile, then a rain of mixed
-spheres, capsules and boxes settling on the debris — all simulated by
-Melon3D (rendering is a small offline script, see [`examples/`](examples/)).*
+*A wrecking ball on a chain of ball joints demolishes a box pyramid, then
+a rain of spheres, capsules and boxes settles over the debris — all
+simulated by Melon3D (rendering is a small offline script, see
+[`examples/`](examples/)).*
 
 ## Why another physics engine?
 
