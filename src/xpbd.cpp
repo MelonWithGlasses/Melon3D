@@ -308,10 +308,80 @@ static void PrepareJoint(m3d_world* world, Joint& j)
 	}
 }
 
+// XPBD angular constraint: remove the rotation error `corr` (axis * angle,
+// world frame). Body A rotates forward by its inertia-weighted share and B
+// backward, like the positional corrections but on the rotational DOFs only.
+// invInertiaWorld stays frozen between corrections within a substep, exactly
+// like the contact projection does.
+static void ApplyAngularCorrection(Body& a, Body& b, m3d_vec3 corr)
+{
+	float theta = m3d_length(corr);
+	if (theta < 1e-9f)
+	{
+		return;
+	}
+	m3d_vec3 n = m3d_scale(1.0f / theta, corr);
+	float wA = a.invMass != 0.0f ? m3d_dot(n, m3d_mat3_mulv(&a.invInertiaWorld, n)) : 0.0f;
+	float wB = b.invMass != 0.0f ? m3d_dot(n, m3d_mat3_mulv(&b.invInertiaWorld, n)) : 0.0f;
+	float denom = wA + wB;
+	if (denom <= 0.0f)
+	{
+		return;
+	}
+	float lambda = theta / denom;
+	m3d_vec3 p = m3d_scale(lambda, n);
+	if (a.invMass != 0.0f)
+	{
+		m3d_vec3 dw = m3d_mat3_mulv(&a.invInertiaWorld, p);
+		m3d_quat wq = { dw.x, dw.y, dw.z, 0.0f };
+		m3d_quat dq = m3d_quat_mul(wq, a.rotation);
+		m3d_quat q = { a.rotation.x + 0.5f * dq.x, a.rotation.y + 0.5f * dq.y, a.rotation.z + 0.5f * dq.z,
+					   a.rotation.w + 0.5f * dq.w };
+		a.rotation = QuatRenormFast(q);
+	}
+	if (b.invMass != 0.0f)
+	{
+		m3d_vec3 dw = m3d_mat3_mulv(&b.invInertiaWorld, p);
+		m3d_quat wq = { -dw.x, -dw.y, -dw.z, 0.0f };
+		m3d_quat dq = m3d_quat_mul(wq, b.rotation);
+		m3d_quat q = { b.rotation.x + 0.5f * dq.x, b.rotation.y + 0.5f * dq.y, b.rotation.z + 0.5f * dq.z,
+					   b.rotation.w + 0.5f * dq.w };
+		b.rotation = QuatRenormFast(q);
+	}
+}
+
 static void SolveJointPosition(m3d_world* world, Joint& j, float h)
 {
 	Body& a = world->bodies[j.bodyA];
 	Body& b = world->bodies[j.bodyB];
+
+	// angular constraints first: they rotate the bodies, and the point
+	// constraint below reads the post-rotation anchors
+	if (j.type == JointType::Hinge)
+	{
+		m3d_vec3 axisA = m3d_rotate(a.rotation, j.localAxisA);
+		m3d_vec3 axisB = m3d_rotate(b.rotation, j.localAxisB);
+		ApplyAngularCorrection(a, b, m3d_cross(axisA, axisB));
+		if (j.enableLimit)
+		{
+			float phi = HingeAngle(a, b, j);
+			float clamped = phi < j.lowerAngle ? j.lowerAngle : (phi > j.upperAngle ? j.upperAngle : phi);
+			if (clamped != phi)
+			{
+				m3d_vec3 axis = m3d_rotate(a.rotation, j.localAxisA);
+				ApplyAngularCorrection(a, b, m3d_scale(phi - clamped, axis));
+			}
+		}
+	}
+	else if (j.type == JointType::Weld)
+	{
+		// error rotation that B carries relative to its welded target pose
+		m3d_quat target = m3d_quat_mul(a.rotation, j.relRot0);
+		m3d_quat qerr = m3d_quat_mul(b.rotation, m3d_quat_conj(target));
+		float sign = qerr.w >= 0.0f ? 1.0f : -1.0f;
+		ApplyAngularCorrection(a, b, m3d_scale(2.0f * sign, m3d_v3(qerr.x, qerr.y, qerr.z)));
+	}
+
 	m3d_vec3 rA = m3d_rotate(a.rotation, j.localAnchorA);
 	m3d_vec3 rB = m3d_rotate(b.rotation, j.localAnchorB);
 	m3d_vec3 d = m3d_sub(m3d_add(b.position, rB), m3d_add(a.position, rA));
@@ -348,6 +418,44 @@ static void SolveJointPosition(m3d_world* world, Joint& j, float h)
 	ApplyPositionCorrection(a, m3d_neg(p), rA);
 }
 
+// Hinge motor, velocity level: drive the relative angular velocity around
+// the hinge axis toward motorSpeed, with the per-substep angular impulse
+// clamped to maxMotorTorque * h (so the motor is also a torque-limited
+// brake when motorSpeed is 0).
+static void SolveJointVelocity(m3d_world* world, Joint& j, float h)
+{
+	if (j.type != JointType::Hinge || !j.enableMotor || j.maxMotorTorque <= 0.0f)
+	{
+		return;
+	}
+	Body& a = world->bodies[j.bodyA];
+	Body& b = world->bodies[j.bodyB];
+	m3d_vec3 axis = m3d_rotate(a.rotation, j.localAxisA);
+	float wA = a.invMass != 0.0f ? m3d_dot(axis, m3d_mat3_mulv(&a.invInertiaWorld, axis)) : 0.0f;
+	float wB = b.invMass != 0.0f ? m3d_dot(axis, m3d_mat3_mulv(&b.invInertiaWorld, axis)) : 0.0f;
+	float denom = wA + wB;
+	if (denom <= 0.0f)
+	{
+		return;
+	}
+	float wrel = m3d_dot(m3d_sub(b.angularVelocity, a.angularVelocity), axis);
+	float dLambda = (j.motorSpeed - wrel) / denom;
+	float budget = j.maxMotorTorque * h;
+	float newLambda = j.motorLambda + dLambda;
+	newLambda = newLambda > budget ? budget : (newLambda < -budget ? -budget : newLambda);
+	dLambda = newLambda - j.motorLambda;
+	j.motorLambda = newLambda;
+	m3d_vec3 p = m3d_scale(dLambda, axis);
+	if (b.invMass != 0.0f)
+	{
+		b.angularVelocity = m3d_add(b.angularVelocity, m3d_mat3_mulv(&b.invInertiaWorld, p));
+	}
+	if (a.invMass != 0.0f)
+	{
+		a.angularVelocity = m3d_sub(a.angularVelocity, m3d_mat3_mulv(&a.invInertiaWorld, p));
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Per-substep stage helpers (shared by the serial and the graph-colored path)
 // ---------------------------------------------------------------------------
@@ -363,6 +471,18 @@ static void IntegrateBodySubstep(m3d_world* world, int32_t bi, float h, m3d_vec3
 	body.prevAngularVelocity = body.angularVelocity;
 
 	body.linearVelocity = m3d_mul_add(body.linearVelocity, h * body.gravityScale, gravity);
+	// user forces/torques (zero-gated: worlds without them are bit-identical
+	// to builds that predate the feature). invInertiaWorld is at most one
+	// substep stale here, which is fine for an explicit force term.
+	if (body.force.x != 0.0f || body.force.y != 0.0f || body.force.z != 0.0f)
+	{
+		body.linearVelocity = m3d_mul_add(body.linearVelocity, h * body.invMass, body.force);
+	}
+	if (body.torque.x != 0.0f || body.torque.y != 0.0f || body.torque.z != 0.0f)
+	{
+		body.angularVelocity =
+			m3d_add(body.angularVelocity, m3d_scale(h, m3d_mat3_mulv(&body.invInertiaWorld, body.torque)));
+	}
 	body.linearVelocity = m3d_scale(1.0f / (1.0f + h * body.linearDamping), body.linearVelocity);
 	body.angularVelocity = m3d_scale(1.0f / (1.0f + h * body.angularDamping), body.angularVelocity);
 
@@ -501,6 +621,7 @@ void SolveIslandXPBD(m3d_world* world, const std::vector<int32_t>& bodyIndices,
 		for (int32_t ji : jointIndices)
 		{
 			world->joints[ji].lambda = 0.0f;
+			world->joints[ji].motorLambda = 0.0f;
 		}
 
 		// position projection; depenetration capped at kMaxDepenetrationSpeed
@@ -532,6 +653,10 @@ void SolveIslandXPBD(m3d_world* world, const std::vector<int32_t>& bodyIndices,
 		for (int32_t ci : contactIndices)
 		{
 			SolveContactVelocity(world, world->contacts[ci], h, gravityLen);
+		}
+		for (int32_t ji : jointIndices)
+		{
+			SolveJointVelocity(world, world->joints[ji], h);
 		}
 	}
 }
@@ -821,6 +946,7 @@ void SolveIslandColoredXPBD(m3d_world* world, const std::vector<int32_t>& bodyIn
 		for (int32_t ji : jointIndices)
 		{
 			world->joints[ji].lambda = 0.0f;
+			world->joints[ji].motorLambda = 0.0f;
 		}
 
 		// pack the color buckets into 8-wide SIMD packets for this substep
@@ -877,6 +1003,10 @@ void SolveIslandColoredXPBD(m3d_world* world, const std::vector<int32_t>& bodyIn
 		for (int32_t ci : world->overflowContacts)
 		{
 			SolveContactVelocity(world, world->contacts[ci], h, gravityLen);
+		}
+		for (int32_t ji : jointIndices)
+		{
+			SolveJointVelocity(world, world->joints[ji], h);
 		}
 	}
 }

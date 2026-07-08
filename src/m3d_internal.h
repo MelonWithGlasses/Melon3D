@@ -92,6 +92,13 @@ struct Body
 	float rollingResistance;
 	float mass;
 
+	// user forces/torques; accumulate between steps, cleared after each step
+	m3d_vec3 force;
+	m3d_vec3 torque;
+
+	m3d_filter filter;
+	bool isSensor;
+
 	m3d_body_type type;
 	float linearDamping;
 	float angularDamping;
@@ -186,6 +193,9 @@ struct Contact
 	float restitution;
 	float rollingResistance;
 	bool touching;
+	// sensor contacts report begin/end events but are never solved and do
+	// not participate in islands or wake propagation
+	bool isSensor;
 
 	// Pose snapshot at manifold generation. While neither body has moved
 	// beyond a small tolerance the manifold is reused: this both skips
@@ -253,6 +263,8 @@ enum class JointType
 {
 	Distance,
 	Ball,
+	Hinge,
+	Weld,
 };
 
 struct Joint
@@ -268,13 +280,43 @@ struct Joint
 	float hertz;
 	float dampingRatio;
 
+	// hinge: axis per body frame plus perpendicular reference vectors that
+	// measure the joint angle (zero at the creation pose)
+	m3d_vec3 localAxisA;
+	m3d_vec3 localAxisB;
+	m3d_vec3 localRefA;
+	m3d_vec3 localRefB;
+	bool enableLimit;
+	float lowerAngle;
+	float upperAngle;
+	bool enableMotor;
+	float motorSpeed;
+	float maxMotorTorque;
+
+	// weld: relative rotation at creation, conj(qA0) * qB0
+	m3d_quat relRot0;
+
 	// transient
-	float compliance; // XPBD alpha [m/N], 0 = rigid
-	float lambda;     // per-substep accumulator
+	float compliance;  // XPBD alpha [m/N], 0 = rigid
+	float lambda;      // per-substep accumulator
+	float motorLambda; // per-substep angular impulse accumulator (motor)
 
 	bool inUse;
 	uint32_t generation;
 };
+
+// Hinge angle of B relative to A around the hinge axis, radians, zero at
+// the creation pose (localRef* are perpendicular reference vectors captured
+// at creation). Shared by the limit projection and the public angle getter.
+inline float HingeAngle(const Body& a, const Body& b, const Joint& j)
+{
+	m3d_vec3 axis = m3d_rotate(a.rotation, j.localAxisA);
+	m3d_vec3 refA = m3d_rotate(a.rotation, j.localRefA);
+	m3d_vec3 refB = m3d_rotate(b.rotation, j.localRefB);
+	float s = m3d_dot(axis, m3d_cross(refA, refB));
+	float c = m3d_dot(refA, refB);
+	return atan2f(s, c);
+}
 
 // ---------------------------------------------------------------------------
 // Broadphase: sorted spatial hash grid
@@ -530,6 +572,7 @@ struct m3d_world
 	std::vector<int32_t> cBodyA;
 	std::vector<int32_t> cBodyB;
 	std::vector<uint8_t> cTouching;
+	std::vector<uint8_t> cSensor;
 
 	m3d::SpatialGrid grid;
 	bool gridDirty = true;
@@ -554,6 +597,10 @@ struct m3d_world
 
 	std::vector<m3d_contact_event> beginEvents;
 	std::vector<m3d_contact_event> endEvents;
+
+	// set by apply_force/apply_torque; gates the end-of-step force clear so
+	// worlds that never use forces pay nothing
+	bool anyForcesApplied = false;
 
 	m3d_profile profile;
 

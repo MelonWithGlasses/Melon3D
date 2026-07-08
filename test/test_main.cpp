@@ -397,6 +397,354 @@ static void TestDeterminismAcrossThreads(void)
 		  "1-thread and 4-thread runs are bit-identical");
 }
 
+// Bodies in the same negative group must pass through each other; bodies
+// with disjoint category/mask must not collide either.
+static void TestCollisionFilter(void)
+{
+	m3d_world_def wd = m3d_world_def_default();
+	m3d_world* world = m3d_world_create(&wd);
+	AddGround(world);
+
+	// negative group: two overlapping-path spheres fall through each other
+	m3d_body_def bd = m3d_body_def_default();
+	bd.type = M3D_BODY_DYNAMIC;
+	bd.position = m3d_v3(0.0f, 4.0f, 0.0f);
+	m3d_shape_def sd = m3d_shape_def_default();
+	sd.type = M3D_SHAPE_SPHERE;
+	sd.radius = 0.5f;
+	sd.filter.groupIndex = -7;
+	m3d_body_id upper = m3d_body_create(world, &bd, &sd);
+	bd.position = m3d_v3(0.0f, 1.0f, 0.0f);
+	m3d_body_id lower = m3d_body_create(world, &bd, &sd);
+
+	// disjoint masks: a "ghost" box that only collides with category 0x2
+	// (the ground is category 0x1) falls straight through the ground
+	bd.position = m3d_v3(5.0f, 2.0f, 0.0f);
+	m3d_shape_def gh = m3d_shape_def_default();
+	gh.type = M3D_SHAPE_BOX;
+	gh.halfExtents = m3d_v3(0.4f, 0.4f, 0.4f);
+	gh.filter.maskBits = 0x2;
+	m3d_body_id ghost = m3d_body_create(world, &bd, &gh);
+
+	for (int i = 0; i < 180; ++i)
+	{
+		m3d_world_step(world, 1.0f / 60.0f, 4);
+	}
+	// both group -7 spheres rest on the ground at the same spot: they
+	// ignored each other but not the ground
+	m3d_vec3 pu = m3d_body_position(world, upper);
+	m3d_vec3 pl = m3d_body_position(world, lower);
+	CHECK(fabsf(pu.y - 0.5f) < 0.05f && fabsf(pl.y - 0.5f) < 0.05f, "same negative group: bodies interpenetrate");
+	CHECK(m3d_body_position(world, ghost).y < -5.0f, "disjoint masks: body ignores the ground");
+	m3d_world_destroy(world);
+}
+
+// A sensor zone must report begin/end events without exerting forces.
+static void TestSensor(void)
+{
+	m3d_world_def wd = m3d_world_def_default();
+	m3d_world* world = m3d_world_create(&wd);
+	AddGround(world);
+
+	m3d_body_def zd = m3d_body_def_default();
+	zd.position = m3d_v3(0.0f, 2.0f, 0.0f); // static trigger volume above the ground
+	m3d_shape_def zs = m3d_shape_def_default();
+	zs.type = M3D_SHAPE_BOX;
+	zs.halfExtents = m3d_v3(1.0f, 1.0f, 1.0f);
+	zs.isSensor = true;
+	m3d_body_id zone = m3d_body_create(world, &zd, &zs);
+
+	m3d_body_def bd = m3d_body_def_default();
+	bd.type = M3D_BODY_DYNAMIC;
+	bd.position = m3d_v3(0.0f, 6.0f, 0.0f);
+	m3d_shape_def sd = m3d_shape_def_default();
+	sd.type = M3D_SHAPE_SPHERE;
+	sd.radius = 0.3f;
+	m3d_body_id ball = m3d_body_create(world, &bd, &sd);
+
+	int sensorBegin = 0, sensorEnd = 0;
+	for (int i = 0; i < 240; ++i)
+	{
+		m3d_world_step(world, 1.0f / 60.0f, 4);
+		m3d_contact_events ev = m3d_world_contact_events(world);
+		for (int k = 0; k < ev.beginCount; ++k)
+		{
+			if (ev.beginEvents[k].isSensor)
+			{
+				++sensorBegin;
+			}
+		}
+		for (int k = 0; k < ev.endCount; ++k)
+		{
+			if (ev.endEvents[k].isSensor)
+			{
+				++sensorEnd;
+			}
+		}
+	}
+	CHECK(sensorBegin >= 1, "sensor reported a begin event");
+	CHECK(sensorEnd >= 1, "sensor reported an end event after the body passed");
+	m3d_vec3 p = m3d_body_position(world, ball);
+	CHECK(fabsf(p.y - 0.3f) < 0.05f, "sensor exerted no force: ball fell through the zone to the ground");
+	(void)zone;
+	m3d_world_destroy(world);
+}
+
+// F = m*a: a constant force must produce the expected velocity, a torque
+// must spin the body.
+static void TestForcesAndTorques(void)
+{
+	m3d_world_def wd = m3d_world_def_default();
+	wd.gravity = m3d_v3_zero();
+	m3d_world* world = m3d_world_create(&wd);
+
+	m3d_body_def bd = m3d_body_def_default();
+	bd.type = M3D_BODY_DYNAMIC;
+	bd.angularDamping = 0.0f;
+	m3d_shape_def sd = m3d_shape_def_default();
+	sd.type = M3D_SHAPE_BOX;
+	sd.halfExtents = m3d_v3(0.5f, 0.5f, 0.5f);
+	sd.density = 1000.0f; // 1 m^3 -> 1000 kg
+	m3d_body_id box = m3d_body_create(world, &bd, &sd);
+
+	for (int i = 0; i < 60; ++i)
+	{
+		m3d_body_apply_force(world, box, m3d_v3(2000.0f, 0.0f, 0.0f)); // a = 2 m/s^2
+		m3d_world_step(world, 1.0f / 60.0f, 4);
+	}
+	m3d_vec3 v = m3d_body_linear_velocity(world, box);
+	CHECK(fabsf(v.x - 2.0f) < 0.05f, "apply_force: v = a*t after 1 s");
+
+	for (int i = 0; i < 60; ++i)
+	{
+		m3d_body_apply_torque(world, box, m3d_v3(0.0f, 500.0f, 0.0f));
+		m3d_world_step(world, 1.0f / 60.0f, 4);
+	}
+	CHECK(m3d_body_angular_velocity(world, box).y > 0.5f, "apply_torque spins the body");
+
+	// forces are cleared after each step: velocity stays constant now
+	m3d_vec3 v0 = m3d_body_linear_velocity(world, box);
+	m3d_world_step(world, 1.0f / 60.0f, 4);
+	m3d_vec3 v1 = m3d_body_linear_velocity(world, box);
+	CHECK(fabsf(v1.x - v0.x) < 1e-6f, "force does not persist past the step");
+	m3d_world_destroy(world);
+}
+
+// A hinge pendulum must swing in the hinge plane only; the limit must stop
+// it; the motor must spin a free wheel to the target speed.
+static void TestHingeJoint(void)
+{
+	m3d_world_def wd = m3d_world_def_default();
+	m3d_world* world = m3d_world_create(&wd);
+
+	// pendulum: box hanging from a static pivot, hinge around Z
+	m3d_body_def ad = m3d_body_def_default();
+	ad.position = m3d_v3(0.0f, 5.0f, 0.0f);
+	m3d_shape_def as = m3d_shape_def_default();
+	as.type = M3D_SHAPE_BOX;
+	as.halfExtents = m3d_v3(0.1f, 0.1f, 0.1f);
+	m3d_body_id pivot = m3d_body_create(world, &ad, &as);
+
+	m3d_body_def bd = m3d_body_def_default();
+	bd.type = M3D_BODY_DYNAMIC;
+	bd.position = m3d_v3(1.0f, 5.0f, 0.0f); // horizontal start: will swing down
+	m3d_shape_def sd = m3d_shape_def_default();
+	sd.type = M3D_SHAPE_BOX;
+	sd.halfExtents = m3d_v3(0.4f, 0.1f, 0.1f);
+	m3d_body_id arm = m3d_body_create(world, &bd, &sd);
+
+	m3d_hinge_joint_def hd = m3d_hinge_joint_def_default();
+	hd.bodyA = pivot;
+	hd.bodyB = arm;
+	hd.localAnchorA = m3d_v3_zero();
+	hd.localAnchorB = m3d_v3(-1.0f, 0.0f, 0.0f);
+	hd.localAxisA = m3d_v3(0.0f, 0.0f, 1.0f);
+	m3d_joint_id hinge = m3d_joint_create_hinge(world, &hd);
+
+	float maxZ = 0.0f;
+	for (int i = 0; i < 240; ++i)
+	{
+		m3d_world_step(world, 1.0f / 60.0f, 4);
+		m3d_vec3 p = m3d_body_position(world, arm);
+		float z = fabsf(p.z);
+		maxZ = z > maxZ ? z : maxZ;
+	}
+	CHECK(maxZ < 0.02f, "hinge pendulum stays in the hinge plane");
+	m3d_vec3 p = m3d_body_position(world, arm);
+	float dist = m3d_length(m3d_sub(p, m3d_v3(0.0f, 5.0f, 0.0f)));
+	CHECK(fabsf(dist - 1.0f) < 0.05f, "hinge point constraint holds the arm at the pivot");
+	m3d_joint_destroy(world, hinge);
+	m3d_body_destroy(world, arm);
+
+	// limited hinge: pendulum released horizontally may not swing below the
+	// -45 degree limit
+	bd.position = m3d_v3(1.0f, 5.0f, 0.0f);
+	arm = m3d_body_create(world, &bd, &sd);
+	hd.bodyB = arm;
+	hd.enableLimit = true;
+	hd.lowerAngle = -0.25f * M3D_PI;
+	hd.upperAngle = 0.25f * M3D_PI;
+	hinge = m3d_joint_create_hinge(world, &hd);
+	float minAngle = 0.0f;
+	for (int i = 0; i < 240; ++i)
+	{
+		m3d_world_step(world, 1.0f / 60.0f, 4);
+		float a = m3d_joint_hinge_angle(world, hinge);
+		minAngle = a < minAngle ? a : minAngle;
+	}
+	CHECK(minAngle > -0.25f * M3D_PI - 0.05f, "hinge limit holds the swing");
+	m3d_joint_destroy(world, hinge);
+	m3d_body_destroy(world, arm);
+
+	// motor: a balanced wheel spun up to 5 rad/s
+	bd.position = m3d_v3(0.0f, 5.0f, 0.0f);
+	m3d_shape_def ws = m3d_shape_def_default();
+	ws.type = M3D_SHAPE_SPHERE;
+	ws.radius = 0.5f;
+	m3d_body_id wheel = m3d_body_create(world, &bd, &ws);
+	hd.bodyB = wheel;
+	hd.localAnchorB = m3d_v3_zero();
+	hd.enableLimit = false;
+	hd.enableMotor = true;
+	hd.motorSpeed = 5.0f;
+	hd.maxMotorTorque = 1000.0f;
+	hinge = m3d_joint_create_hinge(world, &hd);
+	for (int i = 0; i < 120; ++i)
+	{
+		m3d_world_step(world, 1.0f / 60.0f, 4);
+	}
+	CHECK(fabsf(m3d_body_angular_velocity(world, wheel).z - 5.0f) < 0.2f, "hinge motor reaches target speed");
+	m3d_world_destroy(world);
+}
+
+// Welded boxes must move as one rigid body.
+static void TestWeldJoint(void)
+{
+	m3d_world_def wd = m3d_world_def_default();
+	m3d_world* world = m3d_world_create(&wd);
+	AddGround(world);
+
+	m3d_body_id a = AddBox(world, m3d_v3(0.0f, 3.0f, 0.0f), m3d_v3(0.4f, 0.4f, 0.4f), 0.6f);
+	m3d_body_id b = AddBox(world, m3d_v3(0.85f, 3.0f, 0.0f), m3d_v3(0.4f, 0.4f, 0.4f), 0.6f);
+	m3d_weld_joint_def jd = m3d_weld_joint_def_default();
+	jd.bodyA = a;
+	jd.bodyB = b;
+	jd.localAnchorA = m3d_v3(0.425f, 0.0f, 0.0f);
+	jd.localAnchorB = m3d_v3(-0.425f, 0.0f, 0.0f);
+	m3d_joint_create_weld(world, &jd);
+
+	// drop onto the ground and keep simulating: the relative pose must hold
+	for (int i = 0; i < 300; ++i)
+	{
+		m3d_world_step(world, 1.0f / 60.0f, 4);
+	}
+	m3d_vec3 pa = m3d_body_position(world, a);
+	m3d_vec3 pb = m3d_body_position(world, b);
+	CHECK(fabsf(m3d_length(m3d_sub(pb, pa)) - 0.85f) < 0.03f, "weld keeps the anchor distance");
+	m3d_quat qa = m3d_body_rotation(world, a);
+	m3d_quat qb = m3d_body_rotation(world, b);
+	m3d_quat rel = m3d_quat_mul(m3d_quat_conj(qa), qb);
+	CHECK(fabsf(rel.w) > 0.999f, "weld keeps the relative orientation");
+	m3d_world_destroy(world);
+}
+
+// Sphere cast: exact fraction against a box face, plus a clean miss.
+static void TestSphereCastAndOverlap(void)
+{
+	m3d_world_def wd = m3d_world_def_default();
+	m3d_world* world = m3d_world_create(&wd);
+	AddGround(world); // top face at y = 0
+
+	// downward probe from y=2 with a 0.25 sphere must hit at y=0.25 -> t=0.875
+	m3d_ray_result hit = m3d_world_sphere_cast(world, m3d_v3(0.0f, 2.0f, 0.0f), 0.25f, m3d_v3(0.0f, -2.0f, 0.0f),
+											   0xFFFFFFFFu);
+	CHECK(hit.hit, "sphere cast hits the ground");
+	CHECK(fabsf(hit.fraction - 0.875f) < 0.01f, "sphere cast fraction accounts for the radius");
+	CHECK(hit.normal.y > 0.99f, "sphere cast normal points up");
+
+	m3d_ray_result miss = m3d_world_sphere_cast(world, m3d_v3(0.0f, 5.0f, 0.0f), 0.25f, m3d_v3(0.0f, -2.0f, 0.0f),
+												0xFFFFFFFFu);
+	CHECK(!miss.hit, "short sphere cast misses");
+
+	// overlap query: one box inside the region, one outside
+	m3d_body_id inside = AddBox(world, m3d_v3(0.0f, 0.5f, 0.0f), m3d_v3(0.4f, 0.4f, 0.4f), 0.6f);
+	AddBox(world, m3d_v3(20.0f, 0.5f, 0.0f), m3d_v3(0.4f, 0.4f, 0.4f), 0.6f);
+	struct Ctx
+	{
+		int count;
+		m3d_body_id inside;
+		bool sawInside;
+	} ctx = { 0, inside, false };
+	m3d_aabb region = { m3d_v3(-2.0f, 0.1f, -2.0f), m3d_v3(2.0f, 2.0f, 2.0f) };
+	m3d_world_overlap_aabb(world, region,
+						   [](m3d_body_id id, void* c) {
+							   Ctx* cx = (Ctx*)c;
+							   ++cx->count;
+							   if (id.index == cx->inside.index)
+							   {
+								   cx->sawInside = true;
+							   }
+							   return true;
+						   },
+						   &ctx);
+	CHECK(ctx.sawInside, "overlap query finds the box in the region");
+	CHECK(ctx.count == 1, "overlap query skips bodies outside the region");
+	m3d_world_destroy(world);
+}
+
+// Joints must not break determinism across thread counts.
+static void TestJointDeterminism(void)
+{
+	float positions[2][3];
+	for (int pass = 0; pass < 2; ++pass)
+	{
+		m3d_world_def wd = m3d_world_def_default();
+		wd.workerCount = pass == 0 ? 1 : 4;
+		m3d_world* world = m3d_world_create(&wd);
+		AddGround(world);
+
+		// chain of hinged boxes swinging from a static pivot
+		m3d_body_def ad = m3d_body_def_default();
+		ad.position = m3d_v3(0.0f, 8.0f, 0.0f);
+		m3d_shape_def as = m3d_shape_def_default();
+		as.type = M3D_SHAPE_BOX;
+		as.halfExtents = m3d_v3(0.1f, 0.1f, 0.1f);
+		m3d_body_id prev = m3d_body_create(world, &ad, &as);
+		m3d_body_id last = prev;
+		for (int i = 0; i < 6; ++i)
+		{
+			m3d_body_id link = AddBox(world, m3d_v3(0.9f * (float)(i + 1), 8.0f, 0.0f), m3d_v3(0.4f, 0.15f, 0.15f), 0.6f);
+			m3d_hinge_joint_def hd = m3d_hinge_joint_def_default();
+			hd.bodyA = prev;
+			hd.bodyB = link;
+			hd.localAnchorA = i == 0 ? m3d_v3_zero() : m3d_v3(0.45f, 0.0f, 0.0f);
+			hd.localAnchorB = m3d_v3(-0.45f, 0.0f, 0.0f);
+			hd.localAxisA = m3d_v3(0.0f, 0.0f, 1.0f);
+			m3d_joint_create_hinge(world, &hd);
+			prev = link;
+			last = link;
+		}
+		// some boxes raining on the chain to couple contacts and joints
+		for (int i = 0; i < 12; ++i)
+		{
+			AddBox(world, m3d_v3(0.6f * (float)i - 2.0f, 10.0f + 0.3f * (float)i, 0.05f * (float)i),
+				   m3d_v3(0.25f, 0.25f, 0.25f), 0.6f);
+		}
+		for (int i = 0; i < 180; ++i)
+		{
+			m3d_world_step(world, 1.0f / 60.0f, 4);
+		}
+		m3d_vec3 p = m3d_body_position(world, last);
+		positions[pass][0] = p.x;
+		positions[pass][1] = p.y;
+		positions[pass][2] = p.z;
+		m3d_world_destroy(world);
+	}
+	CHECK(positions[0][0] == positions[1][0] && positions[0][1] == positions[1][1] &&
+			  positions[0][2] == positions[1][2],
+		  "hinge chain is bit-identical across thread counts");
+}
+
 int main(void)
 {
 	TestSphereRest();
@@ -410,6 +758,13 @@ int main(void)
 	TestContactEvents();
 	TestSpeculativeNoTunnel();
 	TestDeterminismAcrossThreads();
+	TestCollisionFilter();
+	TestSensor();
+	TestForcesAndTorques();
+	TestHingeJoint();
+	TestWeldJoint();
+	TestSphereCastAndOverlap();
+	TestJointDeterminism();
 
 	printf("\n%d checks, %d failures\n", g_testCount, g_failCount);
 	return g_failCount == 0 ? 0 : 1;

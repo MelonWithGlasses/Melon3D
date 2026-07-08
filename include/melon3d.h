@@ -11,10 +11,14 @@
 //    Jacobians. Zero rest penetration by construction
 //  - Islands with whole-island sleeping; graph-colored solve with 8-wide
 //    SIMD contact packets for big islands
-//  - Joints: distance (rigid or spring via compliance), ball (spherical)
+//  - Joints: distance (rigid or spring via compliance), ball (spherical),
+//    hinge (with limit and motor), weld
+//  - Collision filtering (category/mask/group) and sensor shapes (trigger
+//    volumes that report begin/end events but produce no forces)
 //  - Built-in spin fork-join thread pool; results are bit-identical for
 //    any thread count
-//  - Contact begin/end events, DDA grid ray casting, per-stage profiling
+//  - Contact begin/end events, DDA grid ray casting, sphere casts, AABB
+//    overlap queries, per-stage profiling
 //
 // SPDX-License-Identifier: MIT
 
@@ -26,7 +30,7 @@
 #include <stdint.h>
 
 #define M3D_VERSION_MAJOR 1
-#define M3D_VERSION_MINOR 0
+#define M3D_VERSION_MINOR 1
 #define M3D_VERSION_PATCH 0
 
 #define M3D_PI 3.14159265358979323846f
@@ -264,6 +268,24 @@ typedef enum m3d_shape_type
 	M3D_SHAPE_BOX = 2,
 } m3d_shape_type;
 
+// Collision filter, Box2D-style. Two bodies collide when:
+//  - they share a non-zero groupIndex: positive = always collide,
+//    negative = never collide (masks are not consulted), otherwise
+//  - (a.categoryBits & b.maskBits) and (b.categoryBits & a.maskBits)
+//    are both non-zero.
+typedef struct m3d_filter
+{
+	uint32_t categoryBits; // what this body is (one or more bits, default 0x1)
+	uint32_t maskBits;     // categories this body collides with (default all)
+	int32_t groupIndex;    // 0 = use masks (default)
+} m3d_filter;
+
+static inline m3d_filter m3d_filter_default(void)
+{
+	m3d_filter f = { 0x00000001u, 0xFFFFFFFFu, 0 };
+	return f;
+}
+
 typedef struct m3d_shape_def
 {
 	m3d_shape_type type;
@@ -285,6 +307,13 @@ typedef struct m3d_shape_def
 	// settle piles while balls still roll freely; raise for stickier piles,
 	// lower (or 0) for marble/bowling-style free rolling.
 	float rollingResistance;
+
+	// Collision filter (see m3d_filter). Defaults collide with everything.
+	m3d_filter filter;
+	// Sensor shapes detect overlaps and report contact begin/end events but
+	// generate no contact forces and never wake sleeping bodies. Rays and
+	// sphere casts still hit sensors (filter them out by category if needed).
+	bool isSensor;
 } m3d_shape_def;
 
 typedef struct m3d_body_def
@@ -333,6 +362,41 @@ typedef struct m3d_ball_joint_def
 	m3d_vec3 localAnchorB;
 } m3d_ball_joint_def;
 
+// Hinge (revolute) joint: the anchors coincide and the two local axes stay
+// aligned, leaving one rotational degree of freedom. Optional angle limit
+// and motor. Angles are measured in radians around the hinge axis, zero at
+// the relative orientation the bodies had when the joint was created.
+typedef struct m3d_hinge_joint_def
+{
+	m3d_body_id bodyA;
+	m3d_body_id bodyB;
+	m3d_vec3 localAnchorA;
+	m3d_vec3 localAnchorB;
+	// Hinge axis in each body's local frame (unit length). Leave localAxisB
+	// zero to derive it from the bodies' current poses (the common case:
+	// place the bodies, set localAxisA, create the joint).
+	m3d_vec3 localAxisA;
+	m3d_vec3 localAxisB;
+
+	bool enableLimit;
+	float lowerAngle; // radians, <= 0
+	float upperAngle; // radians, >= 0
+
+	bool enableMotor;
+	float motorSpeed;     // target angular velocity (rad/s) of B relative to A
+	float maxMotorTorque; // N*m; the motor is a brake when motorSpeed is 0
+} m3d_hinge_joint_def;
+
+// Weld joint: locks the two bodies together completely (anchors coincide,
+// relative orientation frozen at creation).
+typedef struct m3d_weld_joint_def
+{
+	m3d_body_id bodyA;
+	m3d_body_id bodyB;
+	m3d_vec3 localAnchorA;
+	m3d_vec3 localAnchorB;
+} m3d_weld_joint_def;
+
 // ---------------------------------------------------------------------------
 // Events, queries, profiling
 // ---------------------------------------------------------------------------
@@ -341,6 +405,7 @@ typedef struct m3d_contact_event
 {
 	m3d_body_id bodyA;
 	m3d_body_id bodyB;
+	bool isSensor; // at least one of the two shapes is a sensor
 } m3d_contact_event;
 
 typedef struct m3d_contact_events
@@ -385,6 +450,8 @@ extern "C"
 M3D_API m3d_world_def m3d_world_def_default(void);
 M3D_API m3d_body_def m3d_body_def_default(void);
 M3D_API m3d_shape_def m3d_shape_def_default(void);
+M3D_API m3d_hinge_joint_def m3d_hinge_joint_def_default(void);
+M3D_API m3d_weld_joint_def m3d_weld_joint_def_default(void);
 
 M3D_API m3d_world* m3d_world_create(const m3d_world_def* def);
 M3D_API void m3d_world_destroy(m3d_world* world);
@@ -405,17 +472,52 @@ M3D_API m3d_vec3 m3d_body_angular_velocity(m3d_world* world, m3d_body_id id);
 M3D_API void m3d_body_set_linear_velocity(m3d_world* world, m3d_body_id id, m3d_vec3 v);
 M3D_API void m3d_body_set_angular_velocity(m3d_world* world, m3d_body_id id, m3d_vec3 w);
 M3D_API void m3d_body_apply_impulse(m3d_world* world, m3d_body_id id, m3d_vec3 impulse, m3d_vec3 worldPoint);
+// Forces and torques accumulate and act for the duration of the next
+// m3d_world_step call, then reset (apply every frame for a sustained push).
+M3D_API void m3d_body_apply_force(m3d_world* world, m3d_body_id id, m3d_vec3 force);
+M3D_API void m3d_body_apply_force_at_point(m3d_world* world, m3d_body_id id, m3d_vec3 force, m3d_vec3 worldPoint);
+M3D_API void m3d_body_apply_torque(m3d_world* world, m3d_body_id id, m3d_vec3 torque);
+M3D_API void m3d_body_apply_angular_impulse(m3d_world* world, m3d_body_id id, m3d_vec3 impulse);
 M3D_API float m3d_body_mass(m3d_world* world, m3d_body_id id);
+M3D_API m3d_body_type m3d_body_get_type(m3d_world* world, m3d_body_id id);
 M3D_API bool m3d_body_is_awake(m3d_world* world, m3d_body_id id);
 M3D_API void m3d_body_wake(m3d_world* world, m3d_body_id id);
 M3D_API uint64_t m3d_body_user_data(m3d_world* world, m3d_body_id id);
+M3D_API void m3d_body_set_user_data(m3d_world* world, m3d_body_id id, uint64_t userData);
+// Material setters also update the combined values on existing contacts.
+M3D_API float m3d_body_friction(m3d_world* world, m3d_body_id id);
+M3D_API void m3d_body_set_friction(m3d_world* world, m3d_body_id id, float friction);
+M3D_API float m3d_body_restitution(m3d_world* world, m3d_body_id id);
+M3D_API void m3d_body_set_restitution(m3d_world* world, m3d_body_id id, float restitution);
+
+M3D_API m3d_vec3 m3d_world_gravity(m3d_world* world);
+// Takes effect next step. Sleeping bodies stay asleep until disturbed.
+M3D_API void m3d_world_set_gravity(m3d_world* world, m3d_vec3 gravity);
 
 M3D_API m3d_joint_id m3d_joint_create_distance(m3d_world* world, const m3d_distance_joint_def* def);
 M3D_API m3d_joint_id m3d_joint_create_ball(m3d_world* world, const m3d_ball_joint_def* def);
+M3D_API m3d_joint_id m3d_joint_create_hinge(m3d_world* world, const m3d_hinge_joint_def* def);
+M3D_API m3d_joint_id m3d_joint_create_weld(m3d_world* world, const m3d_weld_joint_def* def);
 M3D_API void m3d_joint_destroy(m3d_world* world, m3d_joint_id id);
+// Current hinge angle in radians (0 at the creation pose).
+M3D_API float m3d_joint_hinge_angle(m3d_world* world, m3d_joint_id id);
+M3D_API void m3d_joint_hinge_set_motor(m3d_world* world, m3d_joint_id id, bool enable, float motorSpeed,
+									   float maxMotorTorque);
 
 // Cast a ray from origin along translation. Returns the closest hit.
 M3D_API m3d_ray_result m3d_world_ray_cast(m3d_world* world, m3d_vec3 origin, m3d_vec3 translation);
+// Same, but skips bodies whose filter categoryBits do not intersect maskBits.
+M3D_API m3d_ray_result m3d_world_ray_cast_filtered(m3d_world* world, m3d_vec3 origin, m3d_vec3 translation,
+												   uint32_t maskBits);
+// Sweep a sphere of `radius` from origin along translation; closest hit.
+// The workhorse of character controllers (ground probes, step checks).
+M3D_API m3d_ray_result m3d_world_sphere_cast(m3d_world* world, m3d_vec3 origin, float radius, m3d_vec3 translation,
+											 uint32_t maskBits);
+
+// Visit every body whose shape AABB overlaps `aabb`. Return false from the
+// callback to stop early.
+typedef bool (*m3d_overlap_fn)(m3d_body_id body, void* context);
+M3D_API void m3d_world_overlap_aabb(m3d_world* world, m3d_aabb aabb, m3d_overlap_fn fn, void* context);
 
 // Contact begin/end events for the last step. Valid until the next step.
 M3D_API m3d_contact_events m3d_world_contact_events(m3d_world* world);

@@ -109,11 +109,13 @@ void RemoveContactAt(m3d_world* world, int32_t index)
 		world->cBodyA[index] = world->cBodyA[last];
 		world->cBodyB[index] = world->cBodyB[last];
 		world->cTouching[index] = world->cTouching[last];
+		world->cSensor[index] = world->cSensor[last];
 	}
 	world->contacts.pop_back();
 	world->cBodyA.pop_back();
 	world->cBodyB.pop_back();
 	world->cTouching.pop_back();
+	world->cSensor.pop_back();
 }
 
 void WakeBodyInternal(m3d_world* world, int32_t index)
@@ -434,6 +436,28 @@ m3d_shape_def m3d_shape_def_default(void)
 	def.friction = 0.6f;
 	def.restitution = 0.0f;
 	def.rollingResistance = 0.02f;
+	def.filter = m3d_filter_default();
+	def.isSensor = false;
+	return def;
+}
+
+m3d_hinge_joint_def m3d_hinge_joint_def_default(void)
+{
+	m3d_hinge_joint_def def;
+	memset(&def, 0, sizeof(def));
+	def.bodyA = m3d_body_id_null();
+	def.bodyB = m3d_body_id_null();
+	def.localAxisA = m3d_v3(0.0f, 1.0f, 0.0f);
+	// localAxisB left zero: derived from the bodies' poses at creation
+	return def;
+}
+
+m3d_weld_joint_def m3d_weld_joint_def_default(void)
+{
+	m3d_weld_joint_def def;
+	memset(&def, 0, sizeof(def));
+	def.bodyA = m3d_body_id_null();
+	def.bodyB = m3d_body_id_null();
 	return def;
 }
 
@@ -510,6 +534,8 @@ m3d_body_id m3d_body_create(m3d_world* world, const m3d_body_def* bodyDef, const
 	b.friction = shapeDef->friction;
 	b.restitution = shapeDef->restitution;
 	b.rollingResistance = shapeDef->rollingResistance;
+	b.filter = shapeDef->filter;
+	b.isSensor = shapeDef->isSensor;
 
 	ComputeMassProperties(b, shapeDef);
 	UpdateInvInertiaWorld(b);
@@ -540,8 +566,11 @@ void m3d_body_destroy(m3d_world* world, m3d_body_id id)
 			int32_t other = c.bodyA == index ? c.bodyB : c.bodyA;
 			if (c.touching)
 			{
-				WakeBodyInternal(world, other);
-				world->endEvents.push_back({ MakeBodyId(world, c.bodyA), MakeBodyId(world, c.bodyB) });
+				if (!c.isSensor)
+				{
+					WakeBodyInternal(world, other);
+				}
+				world->endEvents.push_back({ MakeBodyId(world, c.bodyA), MakeBodyId(world, c.bodyB), c.isSensor });
 			}
 			RemoveContactAt(world, i);
 		}
@@ -689,6 +718,132 @@ uint64_t m3d_body_user_data(m3d_world* world, m3d_body_id id)
 	return b != nullptr ? b->userData : 0;
 }
 
+void m3d_body_set_user_data(m3d_world* world, m3d_body_id id, uint64_t userData)
+{
+	Body* b = GetBodyChecked(world, id);
+	if (b != nullptr)
+	{
+		b->userData = userData;
+	}
+}
+
+m3d_body_type m3d_body_get_type(m3d_world* world, m3d_body_id id)
+{
+	Body* b = GetBodyChecked(world, id);
+	return b != nullptr ? b->type : M3D_BODY_STATIC;
+}
+
+void m3d_body_apply_force(m3d_world* world, m3d_body_id id, m3d_vec3 force)
+{
+	Body* b = GetBodyChecked(world, id);
+	if (b == nullptr || b->type != M3D_BODY_DYNAMIC)
+	{
+		return;
+	}
+	b->force = m3d_add(b->force, force);
+	world->anyForcesApplied = true;
+	WakeBodyInternal(world, id.index);
+}
+
+void m3d_body_apply_force_at_point(m3d_world* world, m3d_body_id id, m3d_vec3 force, m3d_vec3 worldPoint)
+{
+	Body* b = GetBodyChecked(world, id);
+	if (b == nullptr || b->type != M3D_BODY_DYNAMIC)
+	{
+		return;
+	}
+	b->force = m3d_add(b->force, force);
+	m3d_vec3 r = m3d_sub(worldPoint, b->position);
+	b->torque = m3d_add(b->torque, m3d_cross(r, force));
+	world->anyForcesApplied = true;
+	WakeBodyInternal(world, id.index);
+}
+
+void m3d_body_apply_torque(m3d_world* world, m3d_body_id id, m3d_vec3 torque)
+{
+	Body* b = GetBodyChecked(world, id);
+	if (b == nullptr || b->type != M3D_BODY_DYNAMIC)
+	{
+		return;
+	}
+	b->torque = m3d_add(b->torque, torque);
+	world->anyForcesApplied = true;
+	WakeBodyInternal(world, id.index);
+}
+
+void m3d_body_apply_angular_impulse(m3d_world* world, m3d_body_id id, m3d_vec3 impulse)
+{
+	Body* b = GetBodyChecked(world, id);
+	if (b == nullptr || b->type != M3D_BODY_DYNAMIC)
+	{
+		return;
+	}
+	UpdateInvInertiaWorld(*b);
+	b->angularVelocity = m3d_add(b->angularVelocity, m3d_mat3_mulv(&b->invInertiaWorld, impulse));
+	WakeBodyInternal(world, id.index);
+}
+
+// Recombine the mixed material values on every live contact of this body.
+static void RefreshContactMaterials(m3d_world* world, int32_t bodyIndex)
+{
+	for (Contact& c : world->contacts)
+	{
+		if (c.bodyA != bodyIndex && c.bodyB != bodyIndex)
+		{
+			continue;
+		}
+		Body& a = world->bodies[c.bodyA];
+		Body& b = world->bodies[c.bodyB];
+		c.friction = sqrtf(a.friction * b.friction);
+		c.restitution = a.restitution > b.restitution ? a.restitution : b.restitution;
+		c.rollingResistance = sqrtf(a.rollingResistance * b.rollingResistance);
+	}
+}
+
+float m3d_body_friction(m3d_world* world, m3d_body_id id)
+{
+	Body* b = GetBodyChecked(world, id);
+	return b != nullptr ? b->friction : 0.0f;
+}
+
+void m3d_body_set_friction(m3d_world* world, m3d_body_id id, float friction)
+{
+	Body* b = GetBodyChecked(world, id);
+	if (b == nullptr)
+	{
+		return;
+	}
+	b->friction = friction < 0.0f ? 0.0f : friction;
+	RefreshContactMaterials(world, id.index);
+}
+
+float m3d_body_restitution(m3d_world* world, m3d_body_id id)
+{
+	Body* b = GetBodyChecked(world, id);
+	return b != nullptr ? b->restitution : 0.0f;
+}
+
+void m3d_body_set_restitution(m3d_world* world, m3d_body_id id, float restitution)
+{
+	Body* b = GetBodyChecked(world, id);
+	if (b == nullptr)
+	{
+		return;
+	}
+	b->restitution = restitution < 0.0f ? 0.0f : restitution;
+	RefreshContactMaterials(world, id.index);
+}
+
+m3d_vec3 m3d_world_gravity(m3d_world* world)
+{
+	return world->def.gravity;
+}
+
+void m3d_world_set_gravity(m3d_world* world, m3d_vec3 gravity)
+{
+	world->def.gravity = gravity;
+}
+
 // ---------------------------------------------------------------------------
 // Joints
 // ---------------------------------------------------------------------------
@@ -771,6 +926,118 @@ m3d_joint_id m3d_joint_create_ball(m3d_world* world, const m3d_ball_joint_def* d
 	return id;
 }
 
+m3d_joint_id m3d_joint_create_hinge(m3d_world* world, const m3d_hinge_joint_def* def)
+{
+	Body* a = GetBodyChecked(world, def->bodyA);
+	Body* b = GetBodyChecked(world, def->bodyB);
+	if (a == nullptr || b == nullptr)
+	{
+		return { -1, 0 };
+	}
+	Joint* j;
+	m3d_joint_id id = AllocateJoint(world, &j);
+	j->type = JointType::Hinge;
+	j->bodyA = def->bodyA.index;
+	j->bodyB = def->bodyB.index;
+	j->localAnchorA = def->localAnchorA;
+	j->localAnchorB = def->localAnchorB;
+	j->localAxisA = m3d_normalize(def->localAxisA);
+	if (m3d_length_sq(j->localAxisA) < 0.5f)
+	{
+		j->localAxisA = m3d_v3(0.0f, 1.0f, 0.0f);
+	}
+	// axis B: explicit, or derived so the axes coincide at the creation pose
+	if (m3d_length_sq(def->localAxisB) > 0.5f)
+	{
+		j->localAxisB = m3d_normalize(def->localAxisB);
+	}
+	else
+	{
+		m3d_vec3 axisWorld = m3d_rotate(a->rotation, j->localAxisA);
+		j->localAxisB = m3d_inv_rotate(b->rotation, axisWorld);
+	}
+	// angle references: a world vector perpendicular to the axis, captured in
+	// both local frames, so the current angle reads zero
+	{
+		m3d_vec3 axisWorld = m3d_rotate(a->rotation, j->localAxisA);
+		m3d_vec3 pick = fabsf(axisWorld.x) < 0.9f ? m3d_v3(1.0f, 0.0f, 0.0f) : m3d_v3(0.0f, 1.0f, 0.0f);
+		m3d_vec3 refWorld = m3d_normalize(m3d_cross(axisWorld, pick));
+		j->localRefA = m3d_inv_rotate(a->rotation, refWorld);
+		j->localRefB = m3d_inv_rotate(b->rotation, refWorld);
+	}
+	j->enableLimit = def->enableLimit;
+	j->lowerAngle = def->lowerAngle;
+	j->upperAngle = def->upperAngle;
+	j->enableMotor = def->enableMotor;
+	j->motorSpeed = def->motorSpeed;
+	j->maxMotorTorque = def->maxMotorTorque;
+	j->lambda = 0.0f;
+	j->motorLambda = 0.0f;
+	WakeBodyInternal(world, j->bodyA);
+	WakeBodyInternal(world, j->bodyB);
+	return id;
+}
+
+m3d_joint_id m3d_joint_create_weld(m3d_world* world, const m3d_weld_joint_def* def)
+{
+	Body* a = GetBodyChecked(world, def->bodyA);
+	Body* b = GetBodyChecked(world, def->bodyB);
+	if (a == nullptr || b == nullptr)
+	{
+		return { -1, 0 };
+	}
+	Joint* j;
+	m3d_joint_id id = AllocateJoint(world, &j);
+	j->type = JointType::Weld;
+	j->bodyA = def->bodyA.index;
+	j->bodyB = def->bodyB.index;
+	j->localAnchorA = def->localAnchorA;
+	j->localAnchorB = def->localAnchorB;
+	j->relRot0 = m3d_quat_normalize(m3d_quat_mul(m3d_quat_conj(a->rotation), b->rotation));
+	j->lambda = 0.0f;
+	WakeBodyInternal(world, j->bodyA);
+	WakeBodyInternal(world, j->bodyB);
+	return id;
+}
+
+static Joint* GetJointChecked(m3d_world* world, m3d_joint_id id)
+{
+	if (id.index < 0 || id.index >= (int32_t)world->joints.size())
+	{
+		return nullptr;
+	}
+	Joint& j = world->joints[id.index];
+	if (!j.inUse || j.generation != id.generation)
+	{
+		return nullptr;
+	}
+	return &j;
+}
+
+float m3d_joint_hinge_angle(m3d_world* world, m3d_joint_id id)
+{
+	Joint* j = GetJointChecked(world, id);
+	if (j == nullptr || j->type != JointType::Hinge)
+	{
+		return 0.0f;
+	}
+	return HingeAngle(world->bodies[j->bodyA], world->bodies[j->bodyB], *j);
+}
+
+void m3d_joint_hinge_set_motor(m3d_world* world, m3d_joint_id id, bool enable, float motorSpeed, float maxMotorTorque)
+{
+	Joint* j = GetJointChecked(world, id);
+	if (j == nullptr || j->type != JointType::Hinge)
+	{
+		return;
+	}
+	j->enableMotor = enable;
+	j->motorSpeed = motorSpeed;
+	j->maxMotorTorque = maxMotorTorque < 0.0f ? 0.0f : maxMotorTorque;
+	WakeBodyInternal(world, j->bodyA);
+	WakeBodyInternal(world, j->bodyB);
+}
+
 void m3d_joint_destroy(m3d_world* world, m3d_joint_id id)
 {
 	if (id.index < 0 || id.index >= (int32_t)world->joints.size())
@@ -794,7 +1061,7 @@ void m3d_joint_destroy(m3d_world* world, m3d_joint_id id)
 // Ray casting: 3D DDA over grid cells + coarse list
 // ---------------------------------------------------------------------------
 
-m3d_ray_result m3d_world_ray_cast(m3d_world* world, m3d_vec3 origin, m3d_vec3 translation)
+static m3d_ray_result RayCastInternal(m3d_world* world, m3d_vec3 origin, m3d_vec3 translation, uint32_t maskBits)
 {
 	m3d_ray_result result;
 	result.body = m3d_body_id_null();
@@ -819,7 +1086,7 @@ m3d_ray_result m3d_world_ray_cast(m3d_world* world, m3d_vec3 origin, m3d_vec3 tr
 		}
 		world->rayStamps[bodyIndex] = stamp;
 		Body& b = world->bodies[bodyIndex];
-		if (!b.inUse)
+		if (!b.inUse || (b.filter.categoryBits & maskBits) == 0)
 		{
 			return;
 		}
@@ -915,6 +1182,204 @@ m3d_ray_result m3d_world_ray_cast(m3d_world* world, m3d_vec3 origin, m3d_vec3 tr
 	return result;
 }
 
+m3d_ray_result m3d_world_ray_cast(m3d_world* world, m3d_vec3 origin, m3d_vec3 translation)
+{
+	return RayCastInternal(world, origin, translation, 0xFFFFFFFFu);
+}
+
+m3d_ray_result m3d_world_ray_cast_filtered(m3d_world* world, m3d_vec3 origin, m3d_vec3 translation, uint32_t maskBits)
+{
+	return RayCastInternal(world, origin, translation, maskBits);
+}
+
+// ---------------------------------------------------------------------------
+// Sphere cast and overlap queries
+// ---------------------------------------------------------------------------
+
+// Signed distance from point p to the shape surface (< 0 inside) and the
+// closest point on the surface. Exact for all three shapes.
+static float PointShapeClosest(const Shape& s, m3d_transform xf, m3d_vec3 p, m3d_vec3* closestOut)
+{
+	switch (s.type)
+	{
+	case M3D_SHAPE_SPHERE:
+	{
+		m3d_vec3 d = m3d_sub(p, xf.p);
+		float len = m3d_length(d);
+		m3d_vec3 dir = len > 1e-9f ? m3d_scale(1.0f / len, d) : m3d_v3(0.0f, 1.0f, 0.0f);
+		*closestOut = m3d_mul_add(xf.p, s.radius, dir);
+		return len - s.radius;
+	}
+	case M3D_SHAPE_CAPSULE:
+	{
+		m3d_vec3 axis = m3d_rotate(xf.q, m3d_v3(0.0f, 1.0f, 0.0f));
+		m3d_vec3 pa = m3d_mul_add(xf.p, -s.halfHeight, axis);
+		m3d_vec3 ab = m3d_scale(2.0f * s.halfHeight, axis);
+		float denom = m3d_dot(ab, ab);
+		float t = denom > 1e-12f ? m3d_dot(m3d_sub(p, pa), ab) / denom : 0.0f;
+		t = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
+		m3d_vec3 c = m3d_mul_add(pa, t, ab);
+		m3d_vec3 d = m3d_sub(p, c);
+		float len = m3d_length(d);
+		m3d_vec3 dir = len > 1e-9f ? m3d_scale(1.0f / len, d) : m3d_v3(0.0f, 1.0f, 0.0f);
+		*closestOut = m3d_mul_add(c, s.radius, dir);
+		return len - s.radius;
+	}
+	default: // box
+	{
+		m3d_vec3 lp = m3d_inv_transform_point(xf, p);
+		m3d_vec3 he = s.halfExtents;
+		m3d_vec3 cl = m3d_v3(lp.x < -he.x ? -he.x : (lp.x > he.x ? he.x : lp.x),
+							 lp.y < -he.y ? -he.y : (lp.y > he.y ? he.y : lp.y),
+							 lp.z < -he.z ? -he.z : (lp.z > he.z ? he.z : lp.z));
+		m3d_vec3 diff = m3d_sub(lp, cl);
+		float distSq = m3d_length_sq(diff);
+		if (distSq > 0.0f)
+		{
+			*closestOut = m3d_transform_point(xf, cl);
+			return sqrtf(distSq);
+		}
+		// inside: project to the nearest face
+		float dx = he.x - fabsf(lp.x);
+		float dy = he.y - fabsf(lp.y);
+		float dz = he.z - fabsf(lp.z);
+		m3d_vec3 face = lp;
+		float depth;
+		if (dx <= dy && dx <= dz)
+		{
+			face.x = lp.x >= 0.0f ? he.x : -he.x;
+			depth = dx;
+		}
+		else if (dy <= dz)
+		{
+			face.y = lp.y >= 0.0f ? he.y : -he.y;
+			depth = dy;
+		}
+		else
+		{
+			face.z = lp.z >= 0.0f ? he.z : -he.z;
+			depth = dz;
+		}
+		*closestOut = m3d_transform_point(xf, face);
+		return -depth;
+	}
+	}
+}
+
+m3d_ray_result m3d_world_sphere_cast(m3d_world* world, m3d_vec3 origin, float radius, m3d_vec3 translation,
+									 uint32_t maskBits)
+{
+	m3d_ray_result result;
+	result.body = m3d_body_id_null();
+	result.point = m3d_add(origin, translation);
+	result.normal = m3d_v3_zero();
+	result.fraction = 2.0f;
+	result.hit = false;
+	radius = radius > 0.0f ? radius : 0.0f;
+
+	// candidate prefilter: swept-sphere AABB vs tight shape AABBs. O(bodies),
+	// which is fine for the short casts character controllers make.
+	m3d_vec3 end = m3d_add(origin, translation);
+	m3d_vec3 pad = m3d_v3(radius + 1e-3f, radius + 1e-3f, radius + 1e-3f);
+	m3d_aabb sweep;
+	sweep.lowerBound = m3d_sub(m3d_min(origin, end), pad);
+	sweep.upperBound = m3d_add(m3d_max(origin, end), pad);
+	float len = m3d_length(translation);
+
+	for (int32_t bi = 0; bi < (int32_t)world->bodies.size(); ++bi)
+	{
+		Body& b = world->bodies[bi];
+		if (!b.inUse || (b.filter.categoryBits & maskBits) == 0)
+		{
+			continue;
+		}
+		m3d_transform xf = BodyTransform(b);
+		if (!m3d_aabb_overlap(sweep, ComputeShapeAABB(b.shape, xf)))
+		{
+			continue;
+		}
+
+		// sphere/capsule: exact - a sphere cast IS a ray cast against the
+		// radius-inflated shape. Boxes use conservative advancement on the
+		// exact point-box distance instead (their inflation is a rounded box).
+		if (b.shape.type == M3D_SHAPE_SPHERE || b.shape.type == M3D_SHAPE_CAPSULE)
+		{
+			Shape inflated = b.shape;
+			inflated.radius += radius;
+			float fraction;
+			m3d_vec3 normal;
+			if (RayCastShape(inflated, xf, origin, translation, &fraction, &normal) &&
+				(!result.hit || fraction < result.fraction))
+			{
+				m3d_vec3 center = m3d_mul_add(origin, fraction, translation);
+				result.hit = true;
+				result.body = MakeBodyId(world, bi);
+				result.fraction = fraction;
+				result.normal = normal;
+				result.point = m3d_mul_add(center, -radius, normal);
+			}
+			continue;
+		}
+
+		// conservative advancement along the segment
+		float t = 0.0f;
+		for (int iter = 0; iter < 128; ++iter)
+		{
+			m3d_vec3 p = m3d_mul_add(origin, t, translation);
+			m3d_vec3 closest;
+			float rawDist = PointShapeClosest(b.shape, xf, p, &closest);
+			float d = rawDist - radius;
+			if (d < 1e-4f)
+			{
+				if (!result.hit || t < result.fraction)
+				{
+					result.hit = true;
+					result.body = MakeBodyId(world, bi);
+					result.fraction = t;
+					result.point = closest;
+					m3d_vec3 outward = rawDist >= 0.0f ? m3d_sub(p, closest) : m3d_sub(closest, p);
+					result.normal = m3d_normalize(outward);
+				}
+				break;
+			}
+			if (len < 1e-9f)
+			{
+				break; // zero-length cast: only the start-overlap test applies
+			}
+			t += d / len;
+			if (t > 1.0f || (result.hit && t >= result.fraction))
+			{
+				break;
+			}
+		}
+	}
+	return result;
+}
+
+void m3d_world_overlap_aabb(m3d_world* world, m3d_aabb aabb, m3d_overlap_fn fn, void* context)
+{
+	if (fn == NULL)
+	{
+		return;
+	}
+	for (int32_t bi = 0; bi < (int32_t)world->bodies.size(); ++bi)
+	{
+		Body& b = world->bodies[bi];
+		if (!b.inUse)
+		{
+			continue;
+		}
+		if (!m3d_aabb_overlap(aabb, ComputeShapeAABB(b.shape, BodyTransform(b))))
+		{
+			continue;
+		}
+		if (!fn(MakeBodyId(world, bi), context))
+		{
+			return;
+		}
+	}
+}
+
 m3d_contact_events m3d_world_contact_events(m3d_world* world)
 {
 	m3d_contact_events events;
@@ -1004,6 +1469,19 @@ void m3d_world_step(m3d_world* world, float dt, int substepCount)
 		{
 			return;
 		}
+		// collision filter: shared non-zero group forces or forbids, masks otherwise
+		if (lb.filter.groupIndex != 0 && lb.filter.groupIndex == hb.filter.groupIndex)
+		{
+			if (lb.filter.groupIndex < 0)
+			{
+				return;
+			}
+		}
+		else if ((lb.filter.categoryBits & hb.filter.maskBits) == 0 ||
+				 (hb.filter.categoryBits & lb.filter.maskBits) == 0)
+		{
+			return;
+		}
 		uint64_t key = ContactKey(lo, hi);
 		if (world->contactMap.count(key) != 0)
 		{
@@ -1023,12 +1501,14 @@ void m3d_world_step(m3d_world* world, float dt, int substepCount)
 		c.restitution = lb.restitution > hb.restitution ? lb.restitution : hb.restitution;
 		c.rollingResistance = sqrtf(lb.rollingResistance * hb.rollingResistance);
 		c.touching = false;
+		c.isSensor = lb.isSensor || hb.isSensor;
 		c.hasCache = false;
 		world->contactMap[key] = (int32_t)world->contacts.size();
 		world->contacts.push_back(c);
 		world->cBodyA.push_back(lo);
 		world->cBodyB.push_back(hi);
 		world->cTouching.push_back(0);
+		world->cSensor.push_back(c.isSensor ? 1 : 0);
 	});
 
 	// --- destroy contacts whose expanded AABBs separated ----------------------
@@ -1057,7 +1537,7 @@ void m3d_world_step(m3d_world* world, float dt, int substepCount)
 			Contact& c = world->contacts[i];
 			if (c.touching)
 			{
-				world->endEvents.push_back({ MakeBodyId(world, c.bodyA), MakeBodyId(world, c.bodyB) });
+				world->endEvents.push_back({ MakeBodyId(world, c.bodyA), MakeBodyId(world, c.bodyB), c.isSensor });
 			}
 			RemoveContactAt(world, i);
 		}
@@ -1139,21 +1619,24 @@ void m3d_world_step(m3d_world* world, float dt, int substepCount)
 		Contact& c = world->contacts[i];
 		if (transition[i] > 0)
 		{
-			world->beginEvents.push_back({ MakeBodyId(world, c.bodyA), MakeBodyId(world, c.bodyB) });
-			Body& a = world->bodies[c.bodyA];
-			Body& b = world->bodies[c.bodyB];
-			if (a.isAwake && !b.isAwake)
+			world->beginEvents.push_back({ MakeBodyId(world, c.bodyA), MakeBodyId(world, c.bodyB), c.isSensor });
+			if (!c.isSensor)
 			{
-				WakeBodyInternal(world, c.bodyB);
-			}
-			else if (b.isAwake && !a.isAwake)
-			{
-				WakeBodyInternal(world, c.bodyA);
+				Body& a = world->bodies[c.bodyA];
+				Body& b = world->bodies[c.bodyB];
+				if (a.isAwake && !b.isAwake)
+				{
+					WakeBodyInternal(world, c.bodyB);
+				}
+				else if (b.isAwake && !a.isAwake)
+				{
+					WakeBodyInternal(world, c.bodyA);
+				}
 			}
 		}
 		else
 		{
-			world->endEvents.push_back({ MakeBodyId(world, c.bodyA), MakeBodyId(world, c.bodyB) });
+			world->endEvents.push_back({ MakeBodyId(world, c.bodyA), MakeBodyId(world, c.bodyB), c.isSensor });
 		}
 	}
 	auto tNarrow = Clock::now();
@@ -1207,7 +1690,7 @@ void m3d_world_step(m3d_world* world, float dt, int substepCount)
 	const int32_t contactTotal = (int32_t)world->contacts.size();
 	for (int32_t i = 0; i < contactTotal; ++i)
 	{
-		if (!world->cTouching[i])
+		if (!world->cTouching[i] || world->cSensor[i])
 		{
 			continue;
 		}
@@ -1291,6 +1774,10 @@ void m3d_world_step(m3d_world* world, float dt, int substepCount)
 			continue;
 		}
 		++touchingCount;
+		if (world->cSensor[i])
+		{
+			continue; // sensors report events only, never enter the solver
+		}
 		int32_t ba = world->cBodyA[i], bb = world->cBodyB[i];
 		int32_t dynBody = (world->bFlags[ba] & kBFlagDynamic) ? ba : bb;
 		int32_t idx = islandIndex[find(dynBody)];
@@ -1422,6 +1909,21 @@ void m3d_world_step(m3d_world* world, float dt, int substepCount)
 		Body& b = world->bodies[i];
 		b.position = m3d_mul_add(b.position, dt, b.linearVelocity);
 		b.rotation = m3d_quat_integrate(b.rotation, b.angularVelocity, dt);
+	}
+
+	// user forces act for exactly one step; the flag keeps force-free worlds
+	// from touching any Body here
+	if (world->anyForcesApplied)
+	{
+		for (int32_t i = 0; i < bodyCapacity; ++i)
+		{
+			if (world->bFlags[i] & kBFlagDynamic)
+			{
+				world->bodies[i].force = m3d_v3_zero();
+				world->bodies[i].torque = m3d_v3_zero();
+			}
+		}
+		world->anyForcesApplied = false;
 	}
 
 	// bodyCount/awakeBodyCount are profiling-only; iterate the 1-byte sidecar
