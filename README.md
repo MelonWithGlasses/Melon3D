@@ -10,7 +10,8 @@ dynamics (XPBD)**. Zero dependencies, C-style API, C++17 inside,
 deterministic multithreading out of the box.
 
 ```
-~5k lines · MIT · sphere / capsule / box · joints · sleeping · ray casts
+~6k lines · MIT · sphere / capsule / box · 4 joint types · filtering ·
+sensors · sleeping · ray & sphere casts · single-file build available
 ```
 
 ![Melon3D demo](docs/demo.gif)
@@ -64,20 +65,46 @@ premium on piles that settle and sleep. Honest numbers below.
   Simulation results are **bit-identical for any worker count** — the
   colored path is selected by island size, never by thread count, and
   bodies within a color are disjoint (covered by a test)
-- **Joints**: distance (rigid or spring via XPBD compliance), ball
-- **Queries & events**: contact begin/end events, DDA grid ray casting,
-  per-stage profiling (`m3d_world_profile`)
+- **Joints**: distance (rigid or spring via XPBD compliance), ball,
+  **hinge** (with angle limit and torque-limited motor), **weld** — all
+  solved positionally, so they don't stretch under load
+- **Filtering & sensors**: Box2D-style category/mask/group filtering
+  resolved at pair creation (filtered pairs cost nothing); sensor shapes
+  report begin/end events without generating forces
+- **Forces**: per-step force/torque accumulators, impulses at a point,
+  angular impulses, per-body gravity scale
+- **Queries & events**: contact begin/end events (with sensor flag), DDA
+  grid ray casting (plus filtered variant), **sphere casts** (exact vs
+  spheres/capsules, conservative advancement vs boxes), AABB overlap
+  visitor, per-stage profiling (`m3d_world_profile`)
+
+See the **[developer guide](docs/GUIDE.md)** for recipes: character
+controllers, triggers, ragdoll filtering, motors, tuning.
 
 ## Building
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
-build/melon3d_tests   # 21 checks
+build/melon3d_tests   # 42 checks
 build/melon3d_bench   # benchmark scenes
 ```
 
 GCC / Clang / MSVC, Windows / Linux / macOS. No dependencies.
+
+Or consume it directly from CMake:
+
+```cmake
+include(FetchContent)
+FetchContent_Declare(melon3d
+    GIT_REPOSITORY https://github.com/MelonWithGlasses/Melon3D.git GIT_TAG main)
+FetchContent_MakeAvailable(melon3d)
+target_link_libraries(my_game PRIVATE melon3d::melon3d)
+```
+
+Or go build-system-free: `python tools/amalgamate.py` produces a
+**single-file build** (`melon3d_single.cpp` + `melon3d.h` — drop both into
+any project and compile one file).
 
 ## Quick start
 
@@ -236,10 +263,10 @@ to pay.
 
 ## Roadmap
 
-- Energy-based sleep criterion (close the settle-time gap)
 - SIMD packets for the friction and velocity passes
-- Convex hulls (GJK/EPA), hinge and prismatic joints
-- Multiple shapes per body, shape casts, sensors
+- Convex hulls (GJK/EPA), prismatic joint
+- Multiple shapes per body
+- Optional cross-step warm starting for faster pile settling
 
 ## License
 

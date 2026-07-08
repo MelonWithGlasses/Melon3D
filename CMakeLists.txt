@@ -1,8 +1,17 @@
 cmake_minimum_required(VERSION 3.16)
-project(melon3d VERSION 1.0.0 LANGUAGES CXX)
+project(melon3d VERSION 1.1.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# When consumed via add_subdirectory / FetchContent, build just the library
+if(NOT DEFINED PROJECT_IS_TOP_LEVEL)
+	if(CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
+		set(PROJECT_IS_TOP_LEVEL TRUE)
+	else()
+		set(PROJECT_IS_TOP_LEVEL FALSE)
+	endif()
+endif()
 
 if(NOT CMAKE_BUILD_TYPE)
 	set(CMAKE_BUILD_TYPE Release)
@@ -14,6 +23,7 @@ add_library(melon3d STATIC
 	src/xpbd.cpp
 	src/world.cpp
 )
+add_library(melon3d::melon3d ALIAS melon3d)
 target_include_directories(melon3d PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
 # SIMD flags only where the target actually is x86; Apple Silicon and other
@@ -38,8 +48,8 @@ endif()
 find_package(Threads REQUIRED)
 target_link_libraries(melon3d PUBLIC Threads::Threads)
 
-option(MELON3D_BUILD_TESTS "Build Melon3D tests" ON)
-option(MELON3D_BUILD_BENCHMARKS "Build Melon3D benchmarks" ON)
+option(MELON3D_BUILD_TESTS "Build Melon3D tests" ${PROJECT_IS_TOP_LEVEL})
+option(MELON3D_BUILD_BENCHMARKS "Build Melon3D benchmarks" ${PROJECT_IS_TOP_LEVEL})
 
 if(MELON3D_BUILD_TESTS)
 	enable_testing()
