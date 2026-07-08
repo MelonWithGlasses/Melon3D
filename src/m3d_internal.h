@@ -196,6 +196,12 @@ struct Contact
 	// sensor contacts report begin/end events but are never solved and do
 	// not participate in islands or wake propagation
 	bool isSensor;
+	// thin-feature tunneling rescue armed: a fast body crossed the feature's
+	// midplane inside one step (fresh manifolds point out the FAR side).
+	// While set, manifold regenerations keep the pre-crossing manifold so
+	// the solver pushes the body back out the side it entered from; cleared
+	// once the tracked separation turns positive again.
+	bool tunnelGuard;
 
 	// Pose snapshot at manifold generation. While neither body has moved
 	// beyond a small tolerance the manifold is reused: this both skips
@@ -222,6 +228,28 @@ inline bool PoseChanged(const Body& b, m3d_vec3 cachePos, m3d_quat cacheRot)
 inline uint64_t ContactKey(int32_t a, int32_t b)
 {
 	return ((uint64_t)(uint32_t)a << 32) | (uint32_t)b;
+}
+
+// Smallest anchor-tracked separation of the manifold at the bodies' current
+// poses (the quantity the position solver drives to >= 0). Used by the
+// tunneling rescue to decide when the body is back on the correct side.
+inline float ManifoldTrackedMinSep(const Body& a, const Body& b, const Manifold& m)
+{
+	if (m.pointCount == 0)
+	{
+		return 1e30f;
+	}
+	float mn = 1e30f;
+	for (int32_t i = 0; i < m.pointCount; ++i)
+	{
+		const ManifoldPoint& mp = m.points[i];
+		m3d_vec3 rA = m3d_rotate(a.rotation, mp.localAnchorA);
+		m3d_vec3 rB = m3d_rotate(b.rotation, mp.localAnchorB);
+		float sep = mp.separationOffset +
+					m3d_dot(m3d_sub(m3d_add(b.position, rB), m3d_add(a.position, rA)), m.normal);
+		mn = sep < mn ? sep : mn;
+	}
+	return mn;
 }
 
 // body sidecar flag bits (see m3d_world::bFlags)

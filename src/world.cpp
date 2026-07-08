@@ -876,7 +876,7 @@ m3d_joint_id m3d_joint_create_distance(m3d_world* world, const m3d_distance_join
 {
 	Body* a = GetBodyChecked(world, def->bodyA);
 	Body* b = GetBodyChecked(world, def->bodyB);
-	if (a == nullptr || b == nullptr)
+	if (a == nullptr || b == nullptr || def->bodyA.index == def->bodyB.index)
 	{
 		return { -1, 0 };
 	}
@@ -909,7 +909,7 @@ m3d_joint_id m3d_joint_create_ball(m3d_world* world, const m3d_ball_joint_def* d
 {
 	Body* a = GetBodyChecked(world, def->bodyA);
 	Body* b = GetBodyChecked(world, def->bodyB);
-	if (a == nullptr || b == nullptr)
+	if (a == nullptr || b == nullptr || def->bodyA.index == def->bodyB.index)
 	{
 		return { -1, 0 };
 	}
@@ -930,7 +930,7 @@ m3d_joint_id m3d_joint_create_hinge(m3d_world* world, const m3d_hinge_joint_def*
 {
 	Body* a = GetBodyChecked(world, def->bodyA);
 	Body* b = GetBodyChecked(world, def->bodyB);
-	if (a == nullptr || b == nullptr)
+	if (a == nullptr || b == nullptr || def->bodyA.index == def->bodyB.index)
 	{
 		return { -1, 0 };
 	}
@@ -982,7 +982,7 @@ m3d_joint_id m3d_joint_create_weld(m3d_world* world, const m3d_weld_joint_def* d
 {
 	Body* a = GetBodyChecked(world, def->bodyA);
 	Body* b = GetBodyChecked(world, def->bodyB);
-	if (a == nullptr || b == nullptr)
+	if (a == nullptr || b == nullptr || def->bodyA.index == def->bodyB.index)
 	{
 		return { -1, 0 };
 	}
@@ -1299,6 +1299,24 @@ m3d_ray_result m3d_world_sphere_cast(m3d_world* world, m3d_vec3 origin, float ra
 			continue;
 		}
 
+		// start overlap: the swept sphere already touches at t = 0. Checked
+		// explicitly for every shape because the inflated ray cast below
+		// reports rays that START inside the inflated shape as misses.
+		{
+			m3d_vec3 closest;
+			float rawDist = PointShapeClosest(b.shape, xf, origin, &closest);
+			if (rawDist - radius < 1e-4f)
+			{
+				result.hit = true;
+				result.body = MakeBodyId(world, bi);
+				result.fraction = 0.0f;
+				result.point = closest;
+				m3d_vec3 outward = rawDist >= 0.0f ? m3d_sub(origin, closest) : m3d_sub(closest, origin);
+				result.normal = m3d_normalize(outward);
+				return result; // nothing can beat t = 0
+			}
+		}
+
 		// sphere/capsule: exact - a sphere cast IS a ray cast against the
 		// radius-inflated shape. Boxes use conservative advancement on the
 		// exact point-box distance instead (their inflation is a rounded box).
@@ -1502,6 +1520,7 @@ void m3d_world_step(m3d_world* world, float dt, int substepCount)
 		c.rollingResistance = sqrtf(lb.rollingResistance * hb.rollingResistance);
 		c.touching = false;
 		c.isSensor = lb.isSensor || hb.isSensor;
+		c.tunnelGuard = false;
 		c.hasCache = false;
 		world->contactMap[key] = (int32_t)world->contacts.size();
 		world->contacts.push_back(c);
@@ -1569,6 +1588,19 @@ void m3d_world_step(m3d_world* world, float dt, int substepCount)
 		Contact& c = world->contacts[i];
 		Body& a = world->bodies[c.bodyA];
 		Body& b = world->bodies[c.bodyB];
+
+		// an armed tunneling rescue keeps the pre-crossing manifold until the
+		// body is pushed back out the side it entered from (see xpbd.cpp) -
+		// a fresh manifold here would point out the FAR side and eject it
+		if (c.tunnelGuard)
+		{
+			if (ManifoldTrackedMinSep(a, b, c.manifold) < -kLinearSlop)
+			{
+				world->cTouching[i] = c.touching ? 1 : 0;
+				return;
+			}
+			c.tunnelGuard = false;
+		}
 
 		// reuse the cached manifold while neither body has moved
 		if (!c.hasCache || PoseChanged(a, c.cachePosA, c.cacheRotA) || PoseChanged(b, c.cachePosB, c.cacheRotB))

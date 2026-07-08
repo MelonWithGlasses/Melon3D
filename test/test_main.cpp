@@ -692,6 +692,42 @@ static void TestSphereCastAndOverlap(void)
 	m3d_world_destroy(world);
 }
 
+// A very fast small body must not pass through a thin wall: per-substep
+// travel exceeds the wall span, so the fresh manifold flips to the far
+// face - the tunneling rescue must keep the pre-crossing manifold and
+// push the body back out the side it entered from.
+static void TestThinWallHighSpeed(void)
+{
+	m3d_world_def wd = m3d_world_def_default();
+	m3d_world* world = m3d_world_create(&wd);
+	AddGround(world);
+
+	m3d_body_def wallD = m3d_body_def_default();
+	wallD.position = m3d_v3(20.0f, 2.0f, 0.0f);
+	m3d_shape_def wallS = m3d_shape_def_default();
+	wallS.type = M3D_SHAPE_BOX;
+	wallS.halfExtents = m3d_v3(0.025f, 2.0f, 2.0f); // 5 cm wall
+	m3d_body_create(world, &wallD, &wallS);
+
+	m3d_body_def peaD = m3d_body_def_default();
+	peaD.type = M3D_BODY_DYNAMIC;
+	peaD.position = m3d_v3(12.0f, 2.0f, 0.0f);
+	peaD.linearVelocity = m3d_v3(150.0f, 0.0f, 0.0f); // 0.625 m per substep
+	peaD.gravityScale = 0.0f;
+	m3d_shape_def peaS = m3d_shape_def_default();
+	peaS.type = M3D_SHAPE_SPHERE;
+	peaS.radius = 0.06f;
+	m3d_body_id pea = m3d_body_create(world, &peaD, &peaS);
+
+	for (int i = 0; i < 60; ++i)
+	{
+		m3d_world_step(world, 1.0f / 60.0f, 4);
+	}
+	m3d_vec3 p = m3d_body_position(world, pea);
+	CHECK(p.x < 20.0f, "150 m/s pea ends on the near side of a 5 cm wall");
+	m3d_world_destroy(world);
+}
+
 // Joints must not break determinism across thread counts.
 static void TestJointDeterminism(void)
 {
@@ -764,6 +800,7 @@ int main(void)
 	TestHingeJoint();
 	TestWeldJoint();
 	TestSphereCastAndOverlap();
+	TestThinWallHighSpeed();
 	TestJointDeterminism();
 
 	printf("\n%d checks, %d failures\n", g_testCount, g_failCount);

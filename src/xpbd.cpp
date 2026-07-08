@@ -532,20 +532,105 @@ static void PrepareContactSubstep(m3d_world* world, int32_t ci, float h)
 		float relSpeed = m3d_length(m3d_sub(a.linearVelocity, b.linearVelocity));
 		CollideShapes(a.shape, BodyTransform(a), b.shape, BodyTransform(b), kSpeculativeBase + h * relSpeed,
 					  &c.manifold);
-		InheritFrictionAnchors(oldManifold, c.manifold, a, b);
-		c.hasCache = true;
-		c.cachePosA = a.position;
-		c.cacheRotA = a.rotation;
-		c.cachePosB = b.position;
-		c.cacheRotB = b.rotation;
-		m3d_vec3 nn = c.manifold.normal;
-		for (int32_t i = 0; i < c.manifold.pointCount; ++i)
+
+		// Thin-feature tunneling rescue. Trigger: within one substep the
+		// fresh normal flipped hard against the cached one (> 120 deg) while
+		// the approach along the cached normal covered more than 4 cm in
+		// this substep - i.e. the fast body crossed the feature's midplane
+		// between two substeps (per-substep travel exceeded the feature
+		// thickness). Trusting the flipped manifold would eject it out the
+		// FAR side: tunneling. Instead the pre-crossing manifold is kept
+		// (armed via c.tunnelGuard, honored by the step-level narrowphase
+		// too) until its anchor-tracked separation turns positive again -
+		// the solver pushes the body back out the side it entered from.
+		// Ordinary contacts never trigger: resting/sliding pairs approach at
+		// ~0 and even a 2 m fall moves only ~2.6 cm per substep.
+		bool keepOld = false;
+		if (c.hasCache && oldManifold.pointCount > 0)
 		{
-			ManifoldPoint& mp = c.manifold.points[i];
-			m3d_vec3 rA = m3d_rotate(a.rotation, mp.localAnchorA);
-			m3d_vec3 rB = m3d_rotate(b.rotation, mp.localAnchorB);
-			float ref = m3d_dot(m3d_sub(m3d_add(b.position, rB), m3d_add(a.position, rA)), nn);
-			mp.separationOffset = mp.separation - ref;
+			if (c.tunnelGuard)
+			{
+				keepOld = ManifoldTrackedMinSep(a, b, oldManifold) < -kLinearSlop;
+			}
+			else
+			{
+				// Two signs must agree. (1) The fresh manifold flipped hard
+				// against the cached one (or vanished outright) - ordinary
+				// impacts never flip, they keep pressing on the same face.
+				// (2) The relative path of B's center THIS substep pierces
+				// A's shape inflated by B's core radius: only a true
+				// through-crossing does that. A near-miss passing body flips
+				// speculative normals too, but its path goes BESIDE the
+				// shape, so the segment cast misses and behavior stays
+				// exactly as before. The segment is extended backwards so it
+				// starts outside the inflated shape even when the previous
+				// substep ended in surface contact.
+				bool flipOrGone = c.manifold.pointCount == 0 ||
+								  m3d_dot(c.manifold.normal, oldManifold.normal) < -0.5f;
+				if (flipOrGone)
+				{
+					m3d_vec3 dB = b.type == M3D_BODY_DYNAMIC ? m3d_sub(b.position, b.prevPosition) : m3d_v3_zero();
+					m3d_vec3 dA = a.type == M3D_BODY_DYNAMIC ? m3d_sub(a.position, a.prevPosition) : m3d_v3_zero();
+					m3d_vec3 travel = m3d_sub(dB, dA);
+					float travelLen = m3d_length(travel);
+					float coreB = b.shape.type == M3D_SHAPE_BOX
+									  ? fminf(b.shape.halfExtents.x,
+											  fminf(b.shape.halfExtents.y, b.shape.halfExtents.z))
+									  : b.shape.radius;
+					float minHalfA = a.shape.type == M3D_SHAPE_BOX
+										 ? fminf(a.shape.halfExtents.x,
+												 fminf(a.shape.halfExtents.y, a.shape.halfExtents.z))
+										 : a.shape.radius;
+					// crossing is only geometrically possible when the substep
+					// travel exceeds the thinnest chord through the inflated
+					// shape; below that the pair keeps exact legacy behavior
+					float crossSpan = 2.0f * (minHalfA + coreB);
+					if (travelLen > 0.04f && travelLen > 0.8f * crossSpan)
+					{
+						Shape inflated = a.shape;
+						if (inflated.type == M3D_SHAPE_BOX)
+						{
+							inflated.halfExtents = m3d_add(inflated.halfExtents, m3d_v3(coreB, coreB, coreB));
+						}
+						else
+						{
+							inflated.radius += coreB;
+						}
+						float backup = 2.0f * coreB + 0.02f;
+						m3d_vec3 dir = m3d_scale(1.0f / travelLen, travel);
+						m3d_vec3 origin = m3d_sub(m3d_sub(b.position, dB), m3d_scale(backup, dir));
+						m3d_vec3 seg = m3d_add(travel, m3d_scale(backup, dir));
+						float fhit;
+						m3d_vec3 nhit;
+						keepOld = RayCastShape(inflated, BodyTransform(a), origin, seg, &fhit, &nhit);
+					}
+				}
+			}
+			c.tunnelGuard = keepOld;
+		}
+		if (keepOld)
+		{
+			c.manifold = oldManifold;
+			// cache pose intentionally NOT refreshed: every later substep
+			// re-evaluates against the same pre-crossing manifold
+		}
+		else
+		{
+			InheritFrictionAnchors(oldManifold, c.manifold, a, b);
+			c.hasCache = true;
+			c.cachePosA = a.position;
+			c.cacheRotA = a.rotation;
+			c.cachePosB = b.position;
+			c.cacheRotB = b.rotation;
+			m3d_vec3 nn = c.manifold.normal;
+			for (int32_t i = 0; i < c.manifold.pointCount; ++i)
+			{
+				ManifoldPoint& mp = c.manifold.points[i];
+				m3d_vec3 rA = m3d_rotate(a.rotation, mp.localAnchorA);
+				m3d_vec3 rB = m3d_rotate(b.rotation, mp.localAnchorB);
+				float ref = m3d_dot(m3d_sub(m3d_add(b.position, rB), m3d_add(a.position, rA)), nn);
+				mp.separationOffset = mp.separation - ref;
+			}
 		}
 	}
 
