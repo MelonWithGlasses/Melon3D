@@ -185,27 +185,50 @@ def render_frame(bodies, frame, idx):
             prims.append((-pv[2], 'capsule', (s1, s2, rad, base)))
         else:  # box
             corners = np.array([p + qrot(q, c * b['e']) for c in BOX_CORNERS])
-            cv = np.array([to_view(c) for c in corners])
             for idxs, ln in BOX_FACES:
                 nrm = qrot(q, np.array(ln, dtype=float))
                 fc = corners[idxs].mean(axis=0)
                 if np.dot(nrm, EYE - fc) <= 0:
                     continue
-                poly = []
-                zsum = 0.0; okf = True
-                for k in idxs:
-                    sc, z = project(cv[k])
-                    if sc is None: okf = False; break
-                    poly.append(sc); zsum += -cv[k][2]
-                if not okf: continue
-                prims.append((zsum/4, 'poly', (poly, shade(base, nrm))))
+                col = shade(base, nrm)
+                # Painter's algorithm sorts whole primitives by one depth
+                # value; a face of the 11 m gantry pillar averages its depth
+                # at mid-height, so a capsule at its BASE sorts wrong and
+                # appears to clip through. Large faces are subdivided so
+                # each sub-quad carries a locally correct depth.
+                c0, c1, c2, c3 = (corners[k] for k in idxs)
+                nu = max(1, int(np.linalg.norm(c1 - c0) / 1.5))
+                nv = max(1, int(np.linalg.norm(c3 - c0) / 1.5))
+                for iu in range(nu):
+                    for iv in range(nv):
+                        u0, u1 = iu / nu, (iu + 1) / nu
+                        v0, v1 = iv / nv, (iv + 1) / nv
+                        quad_w = []
+                        for (uu, vv) in ((u0, v0), (u1, v0), (u1, v1), (u0, v1)):
+                            e0 = c0 + (c1 - c0) * uu
+                            e1 = c3 + (c2 - c3) * uu
+                            quad_w.append(e0 + (e1 - e0) * vv)
+                        poly = []
+                        zsum = 0.0; okf = True
+                        for wpt in quad_w:
+                            pv2 = to_view(wpt)
+                            sc, z = project(pv2)
+                            if sc is None: okf = False; break
+                            poly.append(sc); zsum += -pv2[2]
+                        if not okf: continue
+                        outlined = nu == 1 and nv == 1
+                        prims.append((zsum/4, 'poly', (poly, col, outlined)))
 
     prims.sort(key=lambda t: -t[0])  # farthest first
     for _, kind, pl in prims:
         if kind == 'poly':
-            poly, col = pl
-            edge = tuple(int(v * 0.45) for v in col)
-            draw.polygon(poly, fill=col, outline=edge)
+            poly, col, outlined = pl
+            if outlined:
+                edge = tuple(int(v * 0.45) for v in col)
+                draw.polygon(poly, fill=col, outline=edge)
+            else:
+                # subdivided face interior: outlines would draw a grid
+                draw.polygon(poly, fill=col, outline=col)
         elif kind == 'sphere':
             sc, rad, base = pl
             _draw_ball(draw, sc, rad, base)
