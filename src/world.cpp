@@ -1458,14 +1458,22 @@ void m3d_world_step(m3d_world* world, float dt, int substepCount)
 	const bool haveJoints = !jointedPairs.empty();
 
 	// --- candidate pairs from the grid ---------------------------------------
-	world->grid.QueryPairs(world->expandedAABBs, [&](int32_t a, int32_t b) {
+	// Enumeration was the serial floor of the broadphase (~30% of a rain
+	// step at 16T). Every input it reads is frozen during the walk - bodies,
+	// fat AABBs, movedFlag, the contact map, the joint exclusion list - so
+	// the cell runs are split into chunks enumerated in parallel; admitted
+	// pair keys are then turned into contacts serially in ascending chunk
+	// order, which keeps creation order (and everything downstream)
+	// bit-identical for any worker count.
+	// returns true when the pair passes every read-only admission filter
+	auto pairAdmissible = [&](int32_t a, int32_t b) -> bool {
 		if (a == b)
 		{
-			return; // body present in both tiers between stable rebuilds
+			return false; // body present in both tiers between stable rebuilds
 		}
 		if (!world->movedFlag[a] && !world->movedFlag[b])
 		{
-			return; // both inside their fat AABBs: the pair set cannot have changed
+			return false; // both inside their fat AABBs: the pair set cannot have changed
 		}
 		int32_t lo = a < b ? a : b;
 		int32_t hi = a < b ? b : a;
@@ -1473,46 +1481,52 @@ void m3d_world_step(m3d_world* world, float dt, int substepCount)
 		Body& hb = world->bodies[hi];
 		if (!lb.inUse || !hb.inUse)
 		{
-			return;
+			return false;
 		}
 		if (lb.type != M3D_BODY_DYNAMIC && hb.type != M3D_BODY_DYNAMIC)
 		{
-			return;
+			return false;
 		}
 		if (!lb.isAwake && !hb.isAwake)
 		{
-			return;
+			return false;
 		}
 		if (!m3d_aabb_overlap(world->expandedAABBs[lo], world->expandedAABBs[hi]))
 		{
-			return;
+			return false;
 		}
 		// collision filter: shared non-zero group forces or forbids, masks otherwise
 		if (lb.filter.groupIndex != 0 && lb.filter.groupIndex == hb.filter.groupIndex)
 		{
 			if (lb.filter.groupIndex < 0)
 			{
-				return;
+				return false;
 			}
 		}
 		else if ((lb.filter.categoryBits & hb.filter.maskBits) == 0 ||
 				 (hb.filter.categoryBits & lb.filter.maskBits) == 0)
 		{
-			return;
+			return false;
 		}
 		uint64_t key = ContactKey(lo, hi);
 		if (world->contactMap.count(key) != 0)
 		{
-			return;
+			return false;
 		}
 		if (haveJoints && std::binary_search(jointedPairs.begin(), jointedPairs.end(), key))
 		{
-			return;
+			return false;
 		}
+		return true;
+	};
+
+	auto createContact = [&](int32_t lo, int32_t hi) {
+		Body& lb = world->bodies[lo];
+		Body& hb = world->bodies[hi];
 		Contact c;
 		c.bodyA = lo;
 		c.bodyB = hi;
-		c.key = key;
+		c.key = ContactKey(lo, hi);
 		c.manifold.pointCount = 0;
 		c.manifold.normal = m3d_v3(0.0f, 1.0f, 0.0f);
 		c.friction = sqrtf(lb.friction * hb.friction);
@@ -1521,14 +1535,140 @@ void m3d_world_step(m3d_world* world, float dt, int substepCount)
 		c.touching = false;
 		c.isSensor = lb.isSensor || hb.isSensor;
 		c.tunnelGuard = false;
+		c.curved = lb.shape.type != M3D_SHAPE_BOX || hb.shape.type != M3D_SHAPE_BOX;
 		c.hasCache = false;
-		world->contactMap[key] = (int32_t)world->contacts.size();
+		world->contactMap[c.key] = (int32_t)world->contacts.size();
 		world->contacts.push_back(c);
 		world->cBodyA.push_back(lo);
 		world->cBodyB.push_back(hi);
 		world->cTouching.push_back(0);
 		world->cSensor.push_back(c.isSensor ? 1 : 0);
-	});
+	};
+
+	{
+		const SpatialGrid& grid = world->grid;
+		const auto& act = grid.ActiveEntries();
+		const auto& stab = grid.StableEntries();
+		const std::vector<m3d_aabb>& aabbs = world->expandedAABBs;
+
+		// run boundaries over the sorted active entries
+		std::vector<int32_t>& runStarts = world->runStarts;
+		runStarts.clear();
+		for (size_t i = 0; i < act.size(); ++i)
+		{
+			if (i == 0 || act[i].key != act[i - 1].key)
+			{
+				runStarts.push_back((int32_t)i);
+			}
+		}
+		runStarts.push_back((int32_t)act.size());
+		const int32_t runCount = (int32_t)runStarts.size() - 1;
+
+		const int32_t workers = world->pool->WorkerCount();
+		int32_t chunkCount = runCount < 4 * workers ? runCount : 4 * workers;
+		if ((int32_t)world->pairChunks.size() < chunkCount)
+		{
+			world->pairChunks.resize(chunkCount);
+		}
+
+		world->pool->ParallelFor(chunkCount, 1, [&](int32_t ck) {
+			std::vector<uint64_t>& out = world->pairChunks[ck];
+			out.clear();
+			int32_t r0 = (int32_t)((int64_t)runCount * ck / chunkCount);
+			int32_t r1 = (int32_t)((int64_t)runCount * (ck + 1) / chunkCount);
+			for (int32_t r = r0; r < r1; ++r)
+			{
+				int32_t s = runStarts[r], e = runStarts[r + 1];
+				uint64_t key = act[s].key;
+
+				// active x active within this cell
+				for (int32_t i = s; i < e; ++i)
+				{
+					for (int32_t j = i + 1; j < e; ++j)
+					{
+						int32_t a = act[i].body, b = act[j].body;
+						// dedupe: a pair sharing k cells is only reported from
+						// the cell containing the min corner of the overlap
+						m3d_vec3 lo2 = m3d_max(aabbs[a].lowerBound, aabbs[b].lowerBound);
+						if (grid.CellKeyOf(lo2) == key && pairAdmissible(a, b))
+						{
+							out.push_back(ContactKey(a < b ? a : b, a < b ? b : a));
+						}
+					}
+				}
+				// active x stable for the same cell (binary search the stable tier)
+				auto it = std::lower_bound(stab.begin(), stab.end(), key,
+										   [](const SpatialGrid::Entry& en, uint64_t k) { return en.key < k; });
+				for (; it != stab.end() && it->key == key; ++it)
+				{
+					for (int32_t i = s; i < e; ++i)
+					{
+						int32_t a = act[i].body, b = it->body;
+						if (a == b)
+						{
+							continue; // stale stable entry of a body that woke
+						}
+						m3d_vec3 lo2 = m3d_max(aabbs[a].lowerBound, aabbs[b].lowerBound);
+						if (grid.CellKeyOf(lo2) == key && pairAdmissible(a, b))
+						{
+							out.push_back(ContactKey(a < b ? a : b, a < b ? b : a));
+						}
+					}
+				}
+			}
+		});
+
+		// serial creation in ascending chunk order = deterministic
+		for (int32_t ck = 0; ck < chunkCount; ++ck)
+		{
+			for (uint64_t key : world->pairChunks[ck])
+			{
+				createContact((int32_t)(key >> 32), (int32_t)(uint32_t)key);
+			}
+		}
+
+		// oversized bodies (coarse lists) stay serial: they are few
+		const auto& actOver = grid.ActiveOversized();
+		const auto& stabOver = grid.StableOversized();
+		auto tryCreate = [&](int32_t a, int32_t b) {
+			if (pairAdmissible(a, b))
+			{
+				createContact(a < b ? a : b, a < b ? b : a);
+			}
+		};
+		for (size_t oi = 0; oi < actOver.size(); ++oi)
+		{
+			int32_t a = actOver[oi];
+			for (int32_t b = 0; b < (int32_t)aabbs.size(); ++b)
+			{
+				if (b != a && (grid.InActiveCells(b) || grid.InStableCells(b)))
+				{
+					tryCreate(a, b);
+				}
+			}
+			for (size_t oj = oi + 1; oj < actOver.size(); ++oj)
+			{
+				tryCreate(a, actOver[oj]);
+			}
+			for (int32_t b : stabOver)
+			{
+				if (b != a)
+				{
+					tryCreate(a, b);
+				}
+			}
+		}
+		for (int32_t a : stabOver)
+		{
+			for (int32_t b = 0; b < (int32_t)aabbs.size(); ++b)
+			{
+				if (grid.InActiveCells(b))
+				{
+					tryCreate(a, b);
+				}
+			}
+		}
+	}
 
 	// --- destroy contacts whose expanded AABBs separated ----------------------
 	// parallel read-only scan, then serial removal in descending index order

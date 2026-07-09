@@ -212,6 +212,11 @@ struct Contact
 	// the solver pushes the body back out the side it entered from; cleared
 	// once the tracked separation turns positive again.
 	bool tunnelGuard;
+	// at least one curved shape (sphere/capsule): contact arms migrate as
+	// the body rolls, so the velocity pass must rebuild them geometrically;
+	// box-box pairs keep the substep-frozen arms (cheaper, and exact for
+	// faces)
+	bool curved;
 
 	// Pose snapshot at manifold generation. While neither body has moved
 	// beyond a small tolerance the manifold is reused: this both skips
@@ -472,6 +477,8 @@ public:
 	const std::vector<Entry>& StableEntries() const { return m_stable; }
 	const std::vector<int32_t>& ActiveOversized() const { return m_activeOversized; }
 	const std::vector<int32_t>& StableOversized() const { return m_stableOversized; }
+	bool InActiveCells(int32_t body) const { return body < (int32_t)m_inActive.size() && m_inActive[body]; }
+	bool InStableCells(int32_t body) const { return body < (int32_t)m_inStable.size() && m_inStable[body]; }
 	float CellSize() const { return m_cellSize; }
 
 private:
@@ -656,6 +663,12 @@ struct m3d_world
 	// joint-pair exclusion set, rebuilt only when a joint is created/destroyed
 	std::vector<uint64_t> jointedPairs; // sorted
 	bool jointedPairsDirty = true;
+
+	// parallel pair-enumeration scratch: cell-run boundaries plus one
+	// candidate list per chunk (admitted pair keys, created serially in
+	// chunk order so contact order stays worker-count independent)
+	std::vector<int32_t> runStarts;
+	std::vector<std::vector<uint64_t>> pairChunks;
 
 	// solver scratch. Inner vectors are reused (only cleared, never freed):
 	// islandUsed tracks how many are live this step.

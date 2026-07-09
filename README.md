@@ -182,11 +182,11 @@ inflated friction clamp. The comparison stayed honest in both directions.
 
 | Scene | box3d 1T | Melon3D 1T | Melon3D 16T |
 |---|---|---|---|
-| **churn** — 1500 bodies raining, 25 destroyed+respawned each step | 1.262 (2.04) | 1.48 (3.5) | **0.88 (1.4)** |
-| **rain** — 1000 mixed spheres/capsules/boxes falling | **1.010** (2.17) | 1.54 (5.5) | 1.09 (5.6) |
-| **stacks** — 8×8 grid of 6-box towers (384 bodies) | **0.046** (0.90) | 0.240 (2.1) | 0.056 (0.84) |
-| **towers** — 20×20 grid of 3-box towers (1200 bodies) | **0.144** (3.02) | 0.81 (9.6) | 0.18 (2.8) |
-| **pyramid** — 210-box pyramid, one contact island | **0.123** (1.66) | 0.39 (2.2) | 0.41 (2.3) |
+| **churn** — 1500 bodies raining, 25 destroyed+respawned each step | 1.262 (2.04) | 1.23 (2.9) | **0.61 (1.3)** |
+| **rain** — 1000 mixed spheres/capsules/boxes falling | 1.010 (2.17) | 1.43 (4.9) | **0.95 (4.1)** |
+| **stacks** — 8×8 grid of 6-box towers (384 bodies) | **0.046** (0.90) | 0.214 (2.0) | 0.054 (0.85) |
+| **towers** — 20×20 grid of 3-box towers (1200 bodies) | **0.144** (3.02) | 0.69 (6.3) | 0.151 (2.0) |
+| **pyramid** — 210-box pyramid, one contact island | **0.123** (1.66) | 0.34 (2.3) | 0.39 (2.5) |
 
 Fixed per-step cost of a fully-settled (asleep) scene, Melon3D 8 threads —
 a scaling metric, not a box3d comparison: 2400 boxes ≈ 0.08 ms, 8000
@@ -226,16 +226,16 @@ the summary table reflects current numbers, which are equal or better.)
 
 ### Reading the numbers
 
-- **Churn** (streaming spawn/despawn) stays Melon3D's scene, ~30% faster
+- **Churn** (streaming spawn/despawn) is Melon3D's scene, ~50% faster
   than box3d with better worst-frame latency — allocation-free stage
   dispatch, a hash grid indifferent to body lifetime, no warm-start state
-  to rebuild, per-step (not per-substep) collision.
-- **Rain, stacks, towers** are near parity to modestly behind. Part of
-  this is the honest cost of the v1.2 realism audit: with the friction
-  clamp fixed, piles genuinely slide and roll while settling (more awake
-  steps), the gyroscopic term and exact rotation integration add per-body
-  work, and curved contacts recompute their geometric arms. We chose
-  measured-correct physics over the faster glue.
+  to rebuild, per-step (not per-substep) collision, and parallel
+  candidate-pair enumeration.
+- **Rain** is ~6% ahead, **stacks and towers** at parity. These numbers
+  carry the honest cost of the v1.2 realism audit — with the friction
+  clamp fixed, piles genuinely slide and roll while settling, and fast
+  tumbles pay for the gyroscopic term — recovered through the parallel
+  broadphase enumeration and cheaper hot-loop math (v1.2.1).
 - **Pyramid** (one big contact island) is box3d's, ~3× on average. It is
   dominated by *settle time*, not step speed: box3d's warm-started solver
   drives residual velocities below the sleep threshold in fewer frames, so
@@ -257,9 +257,12 @@ instructions.
 1. **Broadphase** — refresh fat AABBs of awake bodies (breach test uses a
    one-step velocity prediction), rebuild the active grid tier; stable
    tier only on membership changes.
-2. **Pairs** — active×active and active×stable candidates from shared
-   cells, min-corner deduplication, only pairs with a *moved* body are
-   re-examined; oversized bodies (e.g. the ground) via a coarse list.
+2. **Pairs** *(parallel)* — active×active and active×stable candidates
+   from shared cells, enumerated in parallel over cell-run chunks
+   (min-corner deduplication, only pairs with a *moved* body are
+   re-examined), then created serially in chunk order so contact order is
+   worker-count independent; oversized bodies (e.g. the ground) via a
+   coarse list.
 3. **Narrowphase** *(parallel when there is real work)* — regenerate
    manifolds only for pairs whose bodies moved 1 mm / 1 mrad; stiction
    anchors are inherited across regenerations by feature id.
