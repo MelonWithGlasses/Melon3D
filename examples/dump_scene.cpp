@@ -184,13 +184,15 @@ int main()
 	}
 
 	// rain of mixed shapes, staggered high: the demolition reads first, then
-	// they fall in and settle over the debris
+	// they fall in and settle over the debris. The drop zone stays clear of
+	// the gantry footprint (beam/pillars and the chain plane live at
+	// x = -2): a sphere perched asleep on the crossbeam reads as a glitch.
 	unsigned seed = 20260708u;
 	auto frand = [&]() { seed = seed * 1664525u + 1013904223u; return (float)(seed >> 8) / (float)0x00FFFFFF; };
 	for (int i = 0; i < 46; ++i)
 	{
-		float x = 9.0f * frand() - 4.5f;
-		float z = 6.0f * frand() - 3.0f;
+		float x = 5.0f * frand() - 0.4f;
+		float z = 4.4f * frand() - 2.2f;
 		float y = 19.0f + 2.0f * i; // higher + more stagger => later rain
 		int kind = i % 3;
 		if (kind == 0)
