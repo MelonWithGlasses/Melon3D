@@ -40,4 +40,11 @@ jobs:
         run: cmake --build build --config Release --parallel
 
       - name: Test
-        run: ctest --test-dir build -C Release --output-on-failure
+        shell: bash
+        # FAIL lines become check-run annotations, which are readable
+        # through the public API even when job logs are not
+        run: |
+          if ! ctest --test-dir build -C Release --output-on-failure 2>&1 | tee test.log; then
+            grep "FAIL" test.log | head -10 | while read -r line; do echo "::error::$line"; done
+            exit 1
+          fi
