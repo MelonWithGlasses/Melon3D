@@ -957,6 +957,33 @@ static void TestDzhanibekov(void)
 // A 15x15 raft of touching boxes on the ground forms ONE island with ~650
 // contacts, so the colored path runs for real - and its results must stay
 // bit-identical across every worker count, not just 1 vs 4.
+static m3d_world* BuildRaftScene(int workerCount, m3d_body_id* bodiesOut, int* bodyCountOut)
+{
+	m3d_world_def wd = m3d_world_def_default();
+	wd.workerCount = workerCount;
+	m3d_world* world = m3d_world_create(&wd);
+	AddGround(world);
+	int n = 0;
+	// 15x15 raft, boxes touching -> one island, ~420 box-box + 225 ground
+	// contacts, comfortably past kBigIslandContacts
+	for (int gx = 0; gx < 15; ++gx)
+	{
+		for (int gz = 0; gz < 15; ++gz)
+		{
+			bodiesOut[n++] = AddBox(world, m3d_v3(1.0f * gx - 7.0f, 0.5f, 1.0f * gz - 7.0f),
+									m3d_v3(0.501f, 0.5f, 0.501f), 0.6f);
+		}
+	}
+	// a few heavy droppers keep the island awake and the packets busy
+	for (int i = 0; i < 5; ++i)
+	{
+		bodiesOut[n++] = AddBox(world, m3d_v3(2.0f * i - 4.0f, 3.0f + 0.7f * i, 0.5f * i - 1.0f),
+								m3d_v3(0.45f, 0.45f, 0.45f), 0.6f);
+	}
+	*bodyCountOut = n;
+	return world;
+}
+
 static void TestColoredPathDeterminism(void)
 {
 	const int workers[] = { 1, 2, 4, 8, 16 };
@@ -967,29 +994,9 @@ static void TestColoredPathDeterminism(void)
 
 	for (int wi = 0; wi < 5; ++wi)
 	{
-		m3d_world_def wd = m3d_world_def_default();
-		wd.workerCount = workers[wi];
-		m3d_world* world = m3d_world_create(&wd);
-		AddGround(world);
-
-		// 15x15 raft, boxes touching -> one island, ~420 box-box + 225
-		// ground contacts, comfortably past kBigIslandContacts
-		m3d_body_id last = { -1, 0 };
-		for (int gx = 0; gx < 15; ++gx)
-		{
-			for (int gz = 0; gz < 15; ++gz)
-			{
-				last = AddBox(world, m3d_v3(1.0f * gx - 7.0f, 0.5f, 1.0f * gz - 7.0f),
-							  m3d_v3(0.501f, 0.5f, 0.501f), 0.6f);
-			}
-		}
-		// a few heavy droppers keep the island awake and the packets busy
-		for (int i = 0; i < 5; ++i)
-		{
-			AddBox(world, m3d_v3(2.0f * i - 4.0f, 3.0f + 0.7f * i, 0.5f * i - 1.0f), m3d_v3(0.45f, 0.45f, 0.45f),
-				   0.6f);
-		}
-
+		m3d_body_id ids[256];
+		int n = 0;
+		m3d_world* world = BuildRaftScene(workers[wi], ids, &n);
 		for (int i = 0; i < 90; ++i)
 		{
 			m3d_world_step(world, 1.0f / 60.0f, 4);
@@ -999,8 +1006,7 @@ static void TestColoredPathDeterminism(void)
 				++coloredIslandSeen;
 			}
 		}
-
-		m3d_vec3 p = m3d_body_position(world, last);
+		m3d_vec3 p = m3d_body_position(world, ids[n - 1]);
 		if (!refSet)
 		{
 			ref[0] = p.x;
@@ -1016,6 +1022,48 @@ static void TestColoredPathDeterminism(void)
 	}
 	CHECK(coloredIslandSeen > 0, "raft scene actually reaches the colored-path contact threshold");
 	CHECK(allSame, "colored SIMD path bit-identical across 1/2/4/8/16 workers");
+
+	// self-diagnosis: on divergence, lockstep 1 vs 4 workers and report the
+	// first step/body where positions differ (as FAIL lines so CI surfaces
+	// them through the annotation mechanism)
+	if (!allSame)
+	{
+		for (int wi = 1; wi < 5; ++wi)
+		{
+			m3d_body_id ids1[256], idsN[256];
+			int n1 = 0, nN = 0;
+			m3d_world* w1 = BuildRaftScene(1, ids1, &n1);
+			m3d_world* wN = BuildRaftScene(workers[wi], idsN, &nN);
+			bool found = false;
+			for (int s = 0; s < 90 && !found; ++s)
+			{
+				m3d_world_step(w1, 1.0f / 60.0f, 4);
+				m3d_world_step(wN, 1.0f / 60.0f, 4);
+				for (int i = 0; i < n1; ++i)
+				{
+					m3d_vec3 p1 = m3d_body_position(w1, ids1[i]);
+					m3d_vec3 pN = m3d_body_position(wN, idsN[i]);
+					if (p1.x != pN.x || p1.y != pN.y || p1.z != pN.z)
+					{
+						union { float f; uint32_t u; } a, b;
+						a.f = p1.x;
+						b.f = pN.x;
+						printf("FAIL: raft 1T-vs-%dT diverges first at step %d body %d: x %08x vs %08x "
+							   "(%.9g vs %.9g), y %.9g vs %.9g\n",
+							   workers[wi], s, i, a.u, b.u, (double)p1.x, (double)pN.x, (double)p1.y, (double)pN.y);
+						found = true;
+						break;
+					}
+				}
+			}
+			m3d_world_destroy(w1);
+			m3d_world_destroy(wN);
+			if (found)
+			{
+				break; // one detailed report is enough
+			}
+		}
+	}
 }
 
 int main(void)
