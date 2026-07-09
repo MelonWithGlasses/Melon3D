@@ -90,8 +90,7 @@ int main()
 	// ground
 	addBox(m3d_v3(0, -1, 0), m3d_v3(60, 1, 60), 0, true, m3d_quat_identity());
 
-	// pyramid of boxes (base 6) at the origin. Slightly slick so the wreck
-	// scatters instead of wedging in place.
+	// pyramid of boxes (base 6) at the origin
 	const float he = 0.5f;
 	const int base = 6;
 	for (int row = 0; row < base; ++row)
@@ -107,7 +106,7 @@ int main()
 			m3d_shape_def sd = m3d_shape_def_default();
 			sd.type = M3D_SHAPE_BOX;
 			sd.halfExtents = m3d_v3(he, he, he);
-			sd.friction = 0.55f;
+			sd.friction = 0.72f;
 			BodyInfo bi;
 			bi.id = m3d_body_create(world, &bd, &sd);
 			bi.shapeType = M3D_SHAPE_BOX;
