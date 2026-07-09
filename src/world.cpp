@@ -1618,11 +1618,21 @@ void m3d_world_step(m3d_world* world, float dt, int substepCount)
 			}
 		});
 
-		// serial creation in ascending chunk order = deterministic
+		// Serial creation in ascending chunk order = deterministic. The map
+		// re-check is NOT redundant: a body that woke since the last stable
+		// rebuild sits in BOTH tiers, so the same pair can be admitted twice
+		// (active x active and active x stale-stable) against the frozen
+		// map - the old serial enumeration rejected the second instance at
+		// creation time, and so must we, or two contacts share one key and
+		// the map corrupts on removal.
 		for (int32_t ck = 0; ck < chunkCount; ++ck)
 		{
 			for (uint64_t key : world->pairChunks[ck])
 			{
+				if (world->contactMap.count(key) != 0)
+				{
+					continue;
+				}
 				createContact((int32_t)(key >> 32), (int32_t)(uint32_t)key);
 			}
 		}
