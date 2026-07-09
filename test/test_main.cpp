@@ -781,6 +781,175 @@ static void TestJointDeterminism(void)
 		  "hinge chain is bit-identical across thread counts");
 }
 
+// Real-world friction laws on an inclined plane: static hold below the
+// cone, Coulomb sliding above it with a = g (sin th - mu cos th).
+static void TestInclinedPlane(void)
+{
+	// shared incline builder
+	auto scene = [](m3d_world** outW, float thetaDeg, float mu) {
+		float th = thetaDeg * M3D_PI / 180.0f;
+		m3d_world_def wd = m3d_world_def_default();
+		m3d_world* w = m3d_world_create(&wd);
+		m3d_body_def gd = m3d_body_def_default();
+		gd.orientation = m3d_quat_axis_angle(m3d_v3(0, 0, 1), th);
+		m3d_shape_def gs = m3d_shape_def_default();
+		gs.type = M3D_SHAPE_BOX;
+		gs.halfExtents = m3d_v3(60, 1, 8);
+		gs.friction = mu;
+		m3d_body_create(w, &gd, &gs);
+		m3d_vec3 nrm = m3d_v3(-sinf(th), cosf(th), 0);
+		m3d_vec3 along = m3d_v3(cosf(th), sinf(th), 0);
+		m3d_body_def bd = m3d_body_def_default();
+		bd.type = M3D_BODY_DYNAMIC;
+		bd.position = m3d_add(m3d_scale(20.0f, along), m3d_scale(1.402f, nrm));
+		bd.orientation = gd.orientation;
+		m3d_shape_def sd = m3d_shape_def_default();
+		sd.type = M3D_SHAPE_BOX;
+		sd.halfExtents = m3d_v3(0.4f, 0.4f, 0.4f);
+		sd.friction = mu;
+		*outW = w;
+		return m3d_body_create(w, &bd, &sd);
+	};
+
+	// 28 deg, mu 0.6 (tan 28 = 0.53): static friction holds
+	m3d_world* w;
+	m3d_body_id box = scene(&w, 28.0f, 0.6f);
+	m3d_vec3 p0 = m3d_body_position(w, box);
+	for (int i = 0; i < 480; ++i)
+	{
+		m3d_world_step(w, 1.0f / 60.0f, 4);
+	}
+	CHECK(m3d_length(m3d_sub(m3d_body_position(w, box), p0)) < 0.05f, "box holds below the friction cone");
+	m3d_world_destroy(w);
+
+	// 38 deg, mu 0.6 (tan 38 = 0.78, past even the ~1.15x static bonus): slides
+	box = scene(&w, 38.0f, 0.6f);
+	p0 = m3d_body_position(w, box);
+	for (int i = 0; i < 480; ++i)
+	{
+		m3d_world_step(w, 1.0f / 60.0f, 4);
+	}
+	CHECK(m3d_length(m3d_sub(m3d_body_position(w, box), p0)) > 0.5f, "box slides above the friction cone");
+	m3d_world_destroy(w);
+
+	// kinetic: 35 deg, mu 0.3 -> a = g (sin - mu cos) = 3.22 m/s^2
+	box = scene(&w, 35.0f, 0.3f);
+	for (int i = 0; i < 60; ++i)
+	{
+		m3d_world_step(w, 1.0f / 240.0f, 1); // break loose
+	}
+	m3d_vec3 v1 = m3d_body_linear_velocity(w, box);
+	for (int i = 0; i < 240; ++i)
+	{
+		m3d_world_step(w, 1.0f / 240.0f, 1);
+	}
+	float aMeas = m3d_length(m3d_sub(m3d_body_linear_velocity(w, box), v1));
+	float th = 35.0f * M3D_PI / 180.0f;
+	float aExp = 9.81f * (sinf(th) - 0.3f * cosf(th));
+	CHECK(fabsf(aMeas - aExp) < 0.1f * aExp, "Coulomb sliding acceleration matches g(sin-mu cos)");
+	m3d_world_destroy(w);
+}
+
+// Rolling dynamics: a solid sphere rolls down at 5/7 g sin(th), converts
+// backspin to translation at v = 2/7 w r, and a free roller must NOT
+// self-accelerate (regression for the contact-arm torque pump).
+static void TestRollingPhysics(void)
+{
+	// rolling downhill
+	{
+		float th = 20.0f * M3D_PI / 180.0f;
+		m3d_world_def wd = m3d_world_def_default();
+		m3d_world* w = m3d_world_create(&wd);
+		m3d_body_def gd = m3d_body_def_default();
+		gd.orientation = m3d_quat_axis_angle(m3d_v3(0, 0, 1), th);
+		m3d_shape_def gs = m3d_shape_def_default();
+		gs.type = M3D_SHAPE_BOX;
+		gs.halfExtents = m3d_v3(60, 1, 8);
+		gs.friction = 0.8f;
+		m3d_body_create(w, &gd, &gs);
+		m3d_body_def bd = m3d_body_def_default();
+		bd.type = M3D_BODY_DYNAMIC;
+		bd.position = m3d_add(m3d_scale(20.0f, m3d_v3(cosf(th), sinf(th), 0)),
+							  m3d_scale(1.402f, m3d_v3(-sinf(th), cosf(th), 0)));
+		bd.angularDamping = 0.0f;
+		m3d_shape_def sd = m3d_shape_def_default();
+		sd.type = M3D_SHAPE_SPHERE;
+		sd.radius = 0.4f;
+		sd.friction = 0.8f;
+		sd.rollingResistance = 0.0f;
+		m3d_body_id ball = m3d_body_create(w, &bd, &sd);
+		for (int i = 0; i < 120; ++i)
+		{
+			m3d_world_step(w, 1.0f / 240.0f, 1);
+		}
+		m3d_vec3 v1 = m3d_body_linear_velocity(w, ball);
+		for (int i = 0; i < 240; ++i)
+		{
+			m3d_world_step(w, 1.0f / 240.0f, 1);
+		}
+		float aMeas = m3d_length(m3d_sub(m3d_body_linear_velocity(w, ball), v1));
+		float aExp = 5.0f / 7.0f * 9.81f * sinf(th);
+		CHECK(fabsf(aMeas - aExp) < 0.08f * aExp, "solid sphere rolls at 5/7 g sin(th)");
+	m3d_world_destroy(w);
+	}
+	// backspin conversion + no self-acceleration
+	{
+		m3d_world_def wd = m3d_world_def_default();
+		m3d_world* w = m3d_world_create(&wd);
+		AddGround(w);
+		m3d_body_def bd = m3d_body_def_default();
+		bd.type = M3D_BODY_DYNAMIC;
+		bd.position = m3d_v3(0, 0.5f, 0);
+		bd.angularVelocity = m3d_v3(0, 0, -10.0f);
+		bd.angularDamping = 0.0f;
+		m3d_shape_def sd = m3d_shape_def_default();
+		sd.type = M3D_SHAPE_SPHERE;
+		sd.radius = 0.5f;
+		sd.friction = 0.5f;
+		sd.rollingResistance = 0.0f;
+		m3d_body_id ball = m3d_body_create(w, &bd, &sd);
+		for (int i = 0; i < 150; ++i)
+		{
+			m3d_world_step(w, 1.0f / 240.0f, 1); // spin-up completes (~0.3 s)
+		}
+		float vRoll = m3d_body_linear_velocity(w, ball).x;
+		CHECK(fabsf(vRoll - 2.0f / 7.0f * 10.0f * 0.5f) < 0.1f, "backspin converts at v = 2/7 w r");
+		for (int i = 0; i < 480; ++i)
+		{
+			m3d_world_step(w, 1.0f / 240.0f, 1);
+		}
+		float vLater = m3d_body_linear_velocity(w, ball).x;
+		CHECK(vLater <= vRoll + 0.02f, "free roller never self-accelerates");
+		m3d_world_destroy(w);
+	}
+}
+
+// The intermediate-axis (Dzhanibekov) instability requires the gyroscopic
+// term: a brick spun about its middle axis must flip.
+static void TestDzhanibekov(void)
+{
+	m3d_world_def wd = m3d_world_def_default();
+	wd.gravity = m3d_v3_zero();
+	m3d_world* w = m3d_world_create(&wd);
+	m3d_body_def bd = m3d_body_def_default();
+	bd.type = M3D_BODY_DYNAMIC;
+	bd.angularDamping = 0.0f;
+	bd.angularVelocity = m3d_v3(0.02f, 8.0f, 0.0f);
+	m3d_shape_def sd = m3d_shape_def_default();
+	sd.type = M3D_SHAPE_BOX;
+	sd.halfExtents = m3d_v3(0.5f, 0.3f, 0.1f);
+	m3d_body_id brick = m3d_body_create(w, &bd, &sd);
+	float minDot = 1.0f;
+	for (int i = 0; i < 2400; ++i)
+	{
+		m3d_world_step(w, 1.0f / 240.0f, 1);
+		float d = m3d_rotate(m3d_body_rotation(w, brick), m3d_v3(0, 1, 0)).y;
+		minDot = d < minDot ? d : minDot;
+	}
+	CHECK(minDot < -0.5f, "Dzhanibekov flip about the intermediate axis");
+	m3d_world_destroy(w);
+}
+
 int main(void)
 {
 	TestSphereRest();
@@ -801,6 +970,9 @@ int main(void)
 	TestWeldJoint();
 	TestSphereCastAndOverlap();
 	TestThinWallHighSpeed();
+	TestInclinedPlane();
+	TestRollingPhysics();
+	TestDzhanibekov();
 	TestJointDeterminism();
 
 	printf("\n%d checks, %d failures\n", g_testCount, g_failCount);

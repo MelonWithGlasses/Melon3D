@@ -8,7 +8,9 @@
 //  - Narrowphase: pose-delta manifold cache; speculative margins
 //  - Solver: XPBD substepping (Mueller et al. 2020) with persistent
 //    stiction friction anchors, per-substep frozen masses and angular
-//    Jacobians. Zero rest penetration by construction
+//    Jacobians. Zero rest penetration by construction. Friction, rolling
+//    and gyroscopic behavior validated against closed-form mechanics
+//    (Coulomb cone, 5/7 g sin rolling, 2/7 spin conversion, Dzhanibekov)
 //  - Islands with whole-island sleeping; graph-colored solve with 8-wide
 //    SIMD contact packets for big islands
 //  - Joints: distance (rigid or spring via compliance), ball (spherical),
@@ -30,7 +32,7 @@
 #include <stdint.h>
 
 #define M3D_VERSION_MAJOR 1
-#define M3D_VERSION_MINOR 1
+#define M3D_VERSION_MINOR 2
 #define M3D_VERSION_PATCH 0
 
 #define M3D_PI 3.14159265358979323846f

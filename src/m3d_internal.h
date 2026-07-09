@@ -47,7 +47,12 @@ constexpr float kSleepAngularVelSq = 0.05f * 0.05f; // (rad/s)^2
 // otherwise keep resetting the sleep timers of settling piles.
 constexpr float kSleepEnergyThresh = kSleepLinearVelSq + kSleepAngularVelSq;
 constexpr float kSleepEnergyAlpha = 0.25f; // per-step smoothing factor
-constexpr float kSleepWakeFactor = 2.0f;   // reset timers above this multiple
+// Timers reset only above this multiple of the threshold. Islands sleep as
+// a whole (min over bodies), so a single twitchy body in a big settling
+// pile holds everyone awake: 3x tolerates the occasional micro-spike of a
+// nearly-settled body (|v| up to ~0.12 m/s) while anything genuinely
+// moving still resets through it.
+constexpr float kSleepWakeFactor = 3.0f;
 constexpr int32_t kOversizedCellSpan = 64;          // grid cells before a body goes to the coarse list
 // Islands with at least this many contacts are solved with graph coloring:
 // contacts are bucketed so no two in a bucket share a dynamic body, giving
@@ -163,6 +168,11 @@ struct ManifoldPoint
 	float lambdaN; // accumulated positional normal correction
 	float lambdaT; // accumulated positional friction correction
 	float separationOffset;
+	// last substep's slip direction. Genuine sliding is direction-coherent
+	// substep over substep; the micro-slip a confined pile recirculates is
+	// not - the velocity pass uses this to tell them apart (see
+	// SolveContactVelocity).
+	m3d_vec3 slipDir;
 
 	// frozen at the start of each substep so the projection iterations and
 	// the velocity pass avoid re-rotating anchors and recomputing masses

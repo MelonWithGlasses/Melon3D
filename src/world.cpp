@@ -1911,7 +1911,14 @@ void m3d_world_step(m3d_world* world, float dt, int substepCount)
 			{
 				b.sleepTime += dt;
 			}
-			// in the hysteresis band the timer holds its value
+			else
+			{
+				// hysteresis band: a pile hovering just above the threshold
+				// is settling, not going anywhere - accumulate at half rate
+				// so borderline piles eventually freeze instead of twitching
+				// awake forever
+				b.sleepTime += 0.5f * dt;
+			}
 			minSleepTime = fminf(minSleepTime, b.sleepTime);
 		}
 		if (canSleep && minSleepTime >= kTimeToSleep)

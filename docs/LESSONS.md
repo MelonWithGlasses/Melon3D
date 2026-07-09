@@ -83,3 +83,57 @@ islands to one worker.
 
 **`std::vector<bool>` is not thread-safe even for disjoint indices.**
 Parallel writers need `std::vector<uint8_t>`.
+
+## Real-world realism (the v1.2 friction and rotation audit)
+
+**Impulse budgets and velocities are different units.** The dynamic
+friction clamp compared `mu * lambdaN * invH` (an impulse) against the
+slip *velocity* and then divided by the effective mass again — inflating
+kinetic friction by 1/w, two orders of magnitude for anything heavier
+than a few kilograms. Every slider was effectively glued: boxes stuck to
+slopes far beyond the friction cone and even fell asleep mid-slide.
+Symptom-level masking (rolling resistance) had been hiding part of this.
+Dimensional analysis on every solver clamp is worth an audit pass.
+
+**A rolling body's stored contact anchor migrates.** The manifold keeps
+material-point anchors; on a curved shape the true contact point moves
+around the surface as the body rolls, so by freeze time the anchor sits
+~w·h off the bottom and `r x n != 0`. Every normal impulse then applies a
+phantom torque about the roll axis *proportional to spin*: a frictionless
+sphere spinning in place accelerated its own spin at +20%/s, exactly
+g·h·m·r/I. Response Jacobians for curved shapes must use the *geometric*
+arm (center -> surface along the normal), not the stored material point.
+
+**Positional stiction needs two gates.** It exists to pin resting face
+contacts (towers), but it must not touch (a) sliding contacts — gate by
+contact tangential speed, or reconstruction turns Coulomb sliding into a
+1 cm/s crawl that falls asleep on a 35-degree slope; (b) curved shapes -
+their contact point migrates, and the lagging pull-back torque pumps
+rollers. Real spheres hold on slopes through rolling resistance, not
+tangential stiction.
+
+**Pile noise and genuine sliding are told apart by direction
+coherence.** A confined pile recirculates micro-slip through positional
+projections faster than the per-substep Coulomb budget can drain it — so
+300-body piles never slept. But that noise flips direction chaotically,
+while a real slope onset pushes the same way every substep. Storing the
+last slip direction per manifold point and applying an asperity-style
+full stop only to slow *incoherent* slip freezes piles without touching
+Coulomb onset (the effective static-vs-kinetic ratio lands at ~1.1-1.15,
+matching real materials where mu_s > mu_k).
+
+**First-order quaternion updates bleed angular momentum.** The
+`q + 0.5 h w q`-then-normalize integrator under-rotates by (wh)^2/12 per
+substep, and the matching small-angle velocity reconstruction compounds
+it: a fast tumble lost 26% of |L| over 10 seconds. An exact
+exponential-map update paired with an exact log-map reconstruction cuts
+that to ~7% (the remainder is the implicit gyroscopic solve, which
+dissipates by design - it never gains energy).
+
+**Cross-build bit-identity is not a valid acceptance gate under FMA.**
+With `-O3 -mavx2 -mfma`, adding any code to a hot translation unit
+legally changes which expressions the compiler contracts into fused
+multiply-adds, which changes rounding, which changes trajectories.
+Proof technique: rebuild both versions with `-ffp-contract=off` and
+compare those checksums instead; within-build 1T-vs-NT determinism is
+unaffected and always valid.

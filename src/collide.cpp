@@ -30,6 +30,7 @@ static void AddManifoldPoint(Manifold* m, m3d_transform xfA, m3d_transform xfB, 
 	mp.lambdaN = 0.0f;
 	mp.lambdaT = 0.0f;
 	mp.separationOffset = 0.0f;
+	mp.slipDir = m3d_v3_zero();
 }
 
 static m3d_vec3 ClosestPointOnSegment(m3d_vec3 p, m3d_vec3 a, m3d_vec3 b)
@@ -866,6 +867,18 @@ void InheritFrictionAnchors(const Manifold& oldManifold, Manifold& manifold, con
 	constexpr float kSlipReleaseSq = 0.02f * 0.02f;   // stretch beyond this = slip, re-anchor
 	constexpr float kFeatureDriftSq = 0.05f * 0.05f;  // sanity: feature must not have jumped
 
+	// Anchor inheritance exists for FACE contacts: it is what stops resting
+	// boxes and towers from creeping. On a curved shape the contact point
+	// physically migrates around the surface as the body rolls - inheriting
+	// the old anchor there plants a stiction target BEHIND the contact,
+	// whose pull-back torque spins the roller up: a free-rolling ball would
+	// slowly accelerate forever. Curved pairs re-anchor on every manifold
+	// regeneration instead (a STATIONARY sphere never regenerates its
+	// manifold, so its static friction still holds on slopes). The slip
+	// DIRECTION however is pure history and carries over for every shape -
+	// the velocity pass needs it to tell coherent sliding from pile noise.
+	bool inheritAnchors = a.shape.type == M3D_SHAPE_BOX && b.shape.type == M3D_SHAPE_BOX;
+
 	m3d_vec3 n = manifold.normal;
 	for (int32_t i = 0; i < manifold.pointCount; ++i)
 	{
@@ -876,6 +889,11 @@ void InheritFrictionAnchors(const Manifold& oldManifold, Manifold& manifold, con
 			if (old.id != mp.id)
 			{
 				continue;
+			}
+			mp.slipDir = old.slipDir;
+			if (!inheritAnchors)
+			{
+				break;
 			}
 			m3d_vec3 pAold = m3d_add(a.position, m3d_rotate(a.rotation, old.frictionAnchorA));
 			m3d_vec3 pBold = m3d_add(b.position, m3d_rotate(b.rotation, old.frictionAnchorB));

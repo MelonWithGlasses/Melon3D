@@ -8,6 +8,10 @@
 // removed by positional projection, so stacks rest exactly on the surface.
 #include "m3d_internal.h"
 
+#ifdef M3D_DBGF
+#include <cstdio>
+#endif
+
 namespace m3d
 {
 
@@ -84,6 +88,33 @@ static inline float GeneralizedInvMass(const Body& b, m3d_vec3 r, m3d_vec3 axis)
 	return b.invMass + m3d_dot(rn, m3d_mat3_mulv(&b.invInertiaWorld, rn));
 }
 
+// Physical contact arm (center -> contact point) for the response
+// Jacobians. For BOXES the stored material anchor is exact. For CURVED
+// shapes the stored anchor is a material point that migrates around the
+// surface as the body rolls: by freeze time it sits ~w*h off the true
+// contact, so r x n != 0 and every normal impulse acquires a phantom
+// torque about the roll axis proportional to w - a frictionless sphere
+// spinning in place pumped its own spin at +20%/s. The true arm follows
+// the geometry instead: radius along the normal (spheres), or the stable
+// axial coordinate plus radius along the normal (capsules).
+static inline m3d_vec3 ContactArm(const Body& body, m3d_vec3 localAnchor, m3d_vec3 n, float sign)
+{
+	switch (body.shape.type)
+	{
+		case M3D_SHAPE_SPHERE:
+			return m3d_scale(sign * body.shape.radius, n);
+		case M3D_SHAPE_CAPSULE:
+		{
+			float hh = body.shape.halfHeight;
+			float axialY = localAnchor.y < -hh ? -hh : (localAnchor.y > hh ? hh : localAnchor.y);
+			m3d_vec3 axis = m3d_rotate(body.rotation, m3d_v3(0.0f, 1.0f, 0.0f));
+			return m3d_add(m3d_scale(axialY, axis), m3d_scale(sign * body.shape.radius, n));
+		}
+		default:
+			return m3d_rotate(body.rotation, localAnchor);
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Contact position projection
 // ---------------------------------------------------------------------------
@@ -142,6 +173,19 @@ static void ApplyContactFriction(m3d_world* world, Contact& c)
 {
 	Body& a = world->bodies[c.bodyA];
 	Body& b = world->bodies[c.bodyB];
+
+	// Positional stiction is a FACE-contact tool: it pins resting boxes so
+	// towers neither creep nor sway-pump. A curved shape's contact point
+	// migrates as it rolls, so a positional tangential target there fights
+	// the rolling motion (and its lag-pull torque slowly pumps a free
+	// roller). Real spheres hold on slopes through rolling resistance, not
+	// tangential stiction - so curved contacts are owned entirely by the
+	// velocity-pass friction and rolling resistance.
+	if (a.shape.type != M3D_SHAPE_BOX || b.shape.type != M3D_SHAPE_BOX)
+	{
+		return;
+	}
+
 	Manifold& man = c.manifold;
 	m3d_vec3 n = man.normal;
 
@@ -154,6 +198,24 @@ static void ApplyContactFriction(m3d_world* world, Contact& c)
 		}
 		m3d_vec3 rA = m3d_rotate(a.rotation, mp.frictionAnchorA);
 		m3d_vec3 rB = m3d_rotate(b.rotation, mp.frictionAnchorB);
+
+		// Speed gate: stiction is a quasi-static device. A contact whose
+		// tangential speed exceeds the gate is SLIDING - the velocity-pass
+		// Coulomb friction owns it, and a positional pull-back here would
+		// only fight the slide (it once turned a 35 deg slope with mu = 0.3
+		// into a 1 cm/s crawl that fell asleep mid-slope). Below the gate
+		// the pull-back cleans up sub-millimeter drift so piles truly stop.
+		constexpr float kStictionMaxSpeedSq = 0.1f * 0.1f;
+		m3d_vec3 vrel = m3d_sub(m3d_add(b.linearVelocity, m3d_cross(b.angularVelocity, rB)),
+								m3d_add(a.linearVelocity, m3d_cross(a.angularVelocity, rA)));
+		m3d_vec3 vtRel = m3d_sub(vrel, m3d_scale(m3d_dot(vrel, n), n));
+		if (m3d_length_sq(vtRel) > kStictionMaxSpeedSq)
+		{
+			mp.frictionAnchorA = mp.localAnchorA;
+			mp.frictionAnchorB = mp.localAnchorB;
+			continue;
+		}
+
 		m3d_vec3 gap = m3d_sub(m3d_add(b.position, rB), m3d_add(a.position, rA));
 		m3d_vec3 dpt = m3d_sub(gap, m3d_scale(m3d_dot(gap, n), n));
 		float lt = m3d_length(dpt);
@@ -169,6 +231,10 @@ static void ApplyContactFriction(m3d_world* world, Contact& c)
 		}
 		float needed = kFrictionRelaxation * (lt / wt);
 		float allowed = c.friction * mp.lambdaN - mp.lambdaT;
+#ifdef M3D_DBGF
+		fprintf(stderr, "STICTION pt%d lt=%.3e need=%.3e allow=%.3e lamN=%.3e wt=%.3e\n", i, lt, needed, allowed,
+				mp.lambdaN, wt);
+#endif
 		if (allowed <= 0.0f)
 		{
 			continue;
@@ -209,36 +275,66 @@ static void SolveContactVelocity(m3d_world* world, Contact& c, float h, float gr
 			continue;
 		}
 
-		m3d_vec3 vrel = m3d_sub(m3d_add(b.linearVelocity, m3d_cross(b.angularVelocity, mp.rB)),
-								m3d_add(a.linearVelocity, m3d_cross(a.angularVelocity, mp.rA)));
+		// contact-point kinematics use fresh GEOMETRIC arms (see ContactArm):
+		// material anchors lag/migrate on rolling bodies, and both the
+		// phantom tangential velocity they measure and the phantom torque
+		// they apply pump free rollers. The frozen angJ/wN stay in use for
+		// the normal response (that freeze is safe, see docs/LESSONS.md).
+		m3d_vec3 rAf = ContactArm(a, mp.localAnchorA, n, 1.0f);
+		m3d_vec3 rBf = ContactArm(b, mp.localAnchorB, n, -1.0f);
+
+		m3d_vec3 vrel = m3d_sub(m3d_add(b.linearVelocity, m3d_cross(b.angularVelocity, rBf)),
+								m3d_add(a.linearVelocity, m3d_cross(a.angularVelocity, rAf)));
 		float vn = m3d_dot(vrel, n);
 		m3d_vec3 vt = m3d_sub(vrel, m3d_scale(vn, n));
 		float vtLen = m3d_length(vt);
 
-		// dynamic friction: decelerate tangential motion, capped by the
-		// Coulomb limit derived from the positional normal correction
+		// Dynamic friction, Coulomb-capped in IMPULSE space: the positional
+		// lambdaN over a substep is a normal impulse Jn = lambdaN * invH, so
+		// the friction impulse obeys P <= mu * Jn, and stopping the slip
+		// outright needs P = vt / wt. (The original code compared mu * Jn
+		// against the slip VELOCITY and then divided by wt again - a unit
+		// mismatch that inflated kinetic friction by 1/wt, two orders of
+		// magnitude for anything heavier than a few kilograms: every slider
+		// was effectively glued, boxes stuck on slopes far beyond the
+		// friction cone, and rolling bodies needed rolling resistance to
+		// mask the resulting artifacts.)
 		if (vtLen > 1e-9f)
 		{
 			m3d_vec3 t = m3d_scale(1.0f / vtLen, vt);
-			float wt = GeneralizedInvMass(a, mp.rA, t) + GeneralizedInvMass(b, mp.rB, t);
+			float wt = GeneralizedInvMass(a, rAf, t) + GeneralizedInvMass(b, rBf, t);
 			if (wt > 0.0f)
 			{
-				float dv = c.friction * mp.lambdaN * invH; // = h * mu * |fn|, fn = lambdaN / h^2
-				dv = dv < vtLen ? dv : vtLen;
-				m3d_vec3 p = m3d_scale(-dv / wt, t);
-				ApplyVelocityImpulse(b, p, mp.rB);
-				ApplyVelocityImpulse(a, m3d_neg(p), mp.rA);
+				// Coherence test: genuine sliding keeps its direction substep
+				// over substep (a slope onset pushes downhill every time), so
+				// it gets the exact Coulomb budget. The micro-slip a confined
+				// pile recirculates flips direction chaotically - for that,
+				// slow incoherent slip, friction acts as an asperity-scale
+				// static stop, or piles churn projection noise forever and a
+				// 300-body pile never sleeps.
+				constexpr float kStaticSlipSpeed = 0.08f;
+				bool coherent = m3d_dot(t, mp.slipDir) > 0.7f;
+				float pStop = vtLen / wt;                       // impulse that zeroes the slip
+				float pMax = c.friction * mp.lambdaN * invH;    // Coulomb impulse budget
+				float P = !coherent && vtLen < kStaticSlipSpeed ? pStop : (pStop < pMax ? pStop : pMax);
+				mp.slipDir = t;
+				m3d_vec3 p = m3d_scale(-P, t);
+#ifdef M3D_DBGF
+				fprintf(stderr, "VFRIC pt%d |vt|=%.4f Pstop=%.4f Pmax=%.4f\n", i, vtLen, pStop, pMax);
+#endif
+				ApplyVelocityImpulse(b, p, rBf);
+				ApplyVelocityImpulse(a, m3d_neg(p), rAf);
 			}
 		}
 
 		// restitution against the pre-substep normal velocity
-		m3d_vec3 vrelPrev = m3d_sub(m3d_add(b.prevLinearVelocity, m3d_cross(b.prevAngularVelocity, mp.rB)),
-									m3d_add(a.prevLinearVelocity, m3d_cross(a.prevAngularVelocity, mp.rA)));
+		m3d_vec3 vrelPrev = m3d_sub(m3d_add(b.prevLinearVelocity, m3d_cross(b.prevAngularVelocity, rBf)),
+									m3d_add(a.prevLinearVelocity, m3d_cross(a.prevAngularVelocity, rAf)));
 		float vnPrev = m3d_dot(vrelPrev, n);
 		float e = fabsf(vnPrev) > 2.0f * gravityLen * h ? c.restitution : 0.0f;
 
-		vrel = m3d_sub(m3d_add(b.linearVelocity, m3d_cross(b.angularVelocity, mp.rB)),
-					   m3d_add(a.linearVelocity, m3d_cross(a.angularVelocity, mp.rA)));
+		vrel = m3d_sub(m3d_add(b.linearVelocity, m3d_cross(b.angularVelocity, rBf)),
+					   m3d_add(a.linearVelocity, m3d_cross(a.angularVelocity, rAf)));
 		vn = m3d_dot(vrel, n);
 		float target = -e * vnPrev;
 		target = target > 0.0f ? target : 0.0f;
@@ -486,10 +582,91 @@ static void IntegrateBodySubstep(m3d_world* world, int32_t bi, float h, m3d_vec3
 	body.linearVelocity = m3d_scale(1.0f / (1.0f + h * body.linearDamping), body.linearVelocity);
 	body.angularVelocity = m3d_scale(1.0f / (1.0f + h * body.angularDamping), body.angularVelocity);
 
+	// Gyroscopic torque w x (I w), solved implicitly in the body frame with
+	// one Newton step (explicit integration of this term blows up). Without
+	// it a tumbling body spins forever around a fixed world axis: no
+	// precession, no intermediate-axis (Dzhanibekov) flip - visibly wrong
+	// for boxes and capsules. Isotropic bodies (spheres) have w x Iw = 0
+	// identically and slow bodies gain nothing, so both skip the solve.
+	{
+		m3d_vec3 il = body.invInertiaLocal;
+		bool anisotropic = il.x != il.y || il.y != il.z;
+		// below ~0.3 rad/s the gyroscopic torque h*w x Iw is far under the
+		// solver's noise floor; skipping it keeps settled piles cheap
+		if (anisotropic && il.x > 0.0f && il.y > 0.0f && il.z > 0.0f &&
+			m3d_length_sq(body.angularVelocity) > 0.1f)
+		{
+			m3d_vec3 w0 = m3d_inv_rotate(body.rotation, body.angularVelocity);
+			m3d_vec3 wl = w0;
+			m3d_vec3 I = m3d_v3(1.0f / il.x, 1.0f / il.y, 1.0f / il.z);
+			// two Newton iterations on the implicit residual
+			// f(w') = I (w' - w0) + h w' x I w'  (one iteration under-damps
+			// fast tumbles and bleeds a few percent of |L| per flip)
+			for (int it = 0; it < 2; ++it)
+			{
+				m3d_vec3 Iw = m3d_v3(I.x * wl.x, I.y * wl.y, I.z * wl.z);
+				m3d_vec3 f = m3d_add(m3d_v3(I.x * (wl.x - w0.x), I.y * (wl.y - w0.y), I.z * (wl.z - w0.z)),
+									 m3d_scale(h, m3d_cross(wl, Iw)));
+				// Jacobian J = diag(I) + h (skew(w) diag(I) - skew(Iw)),
+				// column c: I_c e_c + h (I_c (w x e_c) - Iw x e_c)
+				m3d_vec3 c0 = m3d_add(m3d_v3(I.x, 0, 0),
+									  m3d_scale(h, m3d_sub(m3d_scale(I.x, m3d_cross(wl, m3d_v3(1, 0, 0))),
+														   m3d_cross(Iw, m3d_v3(1, 0, 0)))));
+				m3d_vec3 c1 = m3d_add(m3d_v3(0, I.y, 0),
+									  m3d_scale(h, m3d_sub(m3d_scale(I.y, m3d_cross(wl, m3d_v3(0, 1, 0))),
+														   m3d_cross(Iw, m3d_v3(0, 1, 0)))));
+				m3d_vec3 c2 = m3d_add(m3d_v3(0, 0, I.z),
+									  m3d_scale(h, m3d_sub(m3d_scale(I.z, m3d_cross(wl, m3d_v3(0, 0, 1))),
+														   m3d_cross(Iw, m3d_v3(0, 0, 1)))));
+				float det = m3d_dot(c0, m3d_cross(c1, c2));
+				if (fabsf(det) <= 1e-12f)
+				{
+					break;
+				}
+				// Cramer: solve J dw = -f
+				m3d_vec3 rhs = m3d_neg(f);
+				float invDet = 1.0f / det;
+				m3d_vec3 dw = m3d_v3(m3d_dot(rhs, m3d_cross(c1, c2)) * invDet,
+									 m3d_dot(c0, m3d_cross(rhs, c2)) * invDet,
+									 m3d_dot(c0, m3d_cross(c1, rhs)) * invDet);
+				wl = m3d_add(wl, dw);
+			}
+			body.angularVelocity = m3d_rotate(body.rotation, wl);
+		}
+	}
+
 	body.prevPosition = body.position;
 	body.prevRotation = body.rotation;
 	body.position = m3d_mul_add(body.position, h, body.linearVelocity);
-	body.rotation = m3d_quat_integrate(body.rotation, body.angularVelocity, h);
+	// exact exponential-map rotation update: the first-order
+	// q + 0.5 h w q + renormalize under-rotates by (wh)^2/12 per substep,
+	// and together with the small-angle velocity reconstruction it bled
+	// angular momentum from fast tumbles (26% of |L| over 10 s at 8 rad/s)
+	{
+		float wlen = m3d_length(body.angularVelocity);
+		if (wlen > 1e-9f)
+		{
+			float half = 0.5f * h * wlen;
+			float sinHalf, cosHalf;
+			if (half < 0.02f)
+			{
+				// 4th-order series: error < 1e-9 in this range, and it keeps
+				// the transcendentals out of the per-body per-substep path
+				float h2 = half * half;
+				sinHalf = half * (1.0f - h2 * (1.0f / 6.0f));
+				cosHalf = 1.0f - h2 * 0.5f;
+			}
+			else
+			{
+				sinHalf = sinf(half);
+				cosHalf = cosf(half);
+			}
+			float s = sinHalf / wlen;
+			m3d_quat dq = { body.angularVelocity.x * s, body.angularVelocity.y * s, body.angularVelocity.z * s,
+							cosHalf };
+			body.rotation = m3d_quat_normalize(m3d_quat_mul(dq, body.rotation));
+		}
+	}
 	UpdateInvInertiaWorld(body);
 }
 
@@ -641,8 +818,8 @@ static void PrepareContactSubstep(m3d_world* world, int32_t ci, float h)
 		ManifoldPoint& mp = c.manifold.points[i];
 		mp.lambdaN = 0.0f;
 		mp.lambdaT = 0.0f;
-		mp.rA = m3d_rotate(a.rotation, mp.localAnchorA);
-		mp.rB = m3d_rotate(b.rotation, mp.localAnchorB);
+		mp.rA = ContactArm(a, mp.localAnchorA, n, 1.0f);
+		mp.rB = ContactArm(b, mp.localAnchorB, n, -1.0f);
 		m3d_vec3 crossA = m3d_cross(mp.rA, n);
 		m3d_vec3 crossB = m3d_cross(mp.rB, n);
 		mp.angJA = m3d_mat3_mulv(&a.invInertiaWorld, crossA);
@@ -661,7 +838,23 @@ static void ReconstructBodyVelocity(m3d_world* world, int32_t bi, float invH)
 	body.linearVelocity = m3d_scale(invH, m3d_sub(body.position, body.prevPosition));
 	m3d_quat dq = m3d_quat_mul(body.rotation, m3d_quat_conj(body.prevRotation));
 	float sign = dq.w >= 0.0f ? 1.0f : -1.0f;
-	body.angularVelocity = m3d_scale(2.0f * invH * sign, m3d_v3(dq.x, dq.y, dq.z));
+	// exact log map: |vec(dq)| = sin(theta/2), so the plain 2/h * vec(dq)
+	// small-angle form under-reports fast spins; recover theta exactly to
+	// pair with the exponential-map integration above
+	float v2 = dq.x * dq.x + dq.y * dq.y + dq.z * dq.z;
+	if (v2 > 4e-4f)
+	{
+		float vlen = sqrtf(v2);
+		float angle = 2.0f * atan2f(vlen, fabsf(dq.w));
+		body.angularVelocity = m3d_scale(sign * invH * angle / vlen, m3d_v3(dq.x, dq.y, dq.z));
+	}
+	else
+	{
+		// small angles: theta/sin(theta/2) ~ 2 (1 + s^2/6), error < 1e-9 -
+		// no atan2 in the common path
+		float corr = 1.0f + v2 * (1.0f / 6.0f);
+		body.angularVelocity = m3d_scale(2.0f * invH * sign * corr, m3d_v3(dq.x, dq.y, dq.z));
+	}
 }
 
 // ---------------------------------------------------------------------------

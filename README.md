@@ -52,11 +52,18 @@ premium on piles that settle and sleep. Honest numbers below.
 - **Solver**: XPBD substepping (Müller et al. 2020)
   - persistent **stiction anchors** for static friction — no creep, no
     sway pumping, piles come to a true stop and sleep
-  - per-substep frozen effective masses and angular Jacobians
+  - **friction validated against closed-form mechanics**: static hold
+    exactly at the Coulomb cone (with a realistic ~1.1× static-vs-kinetic
+    ratio), sliding at `g(sinθ − μcosθ)` to 5%, solid spheres rolling
+    downhill at `5/7·g·sinθ` to 1%, backspin converting at `v = 2/7·ωr`
+  - **implicit gyroscopic torque** — tumbling bodies precess and show the
+    intermediate-axis (Dzhanibekov) flip; exact exponential-map rotation
+    integration keeps fast tumbles' angular momentum
+  - per-substep frozen effective masses and angular Jacobians; geometric
+    contact arms for curved shapes (no phantom rolling torque)
   - depenetration capped at 3 m/s; separate restitution/dynamic-friction
     velocity pass
-  - **rolling resistance** for spheres/capsules so piles settle instead of
-    rolling forever (per-shape, default on)
+  - **rolling resistance** for spheres/capsules (per-shape, default on)
 - **Islands & sleeping**: union-find islands, whole-island sleep/wake
 - **Big-island parallelism**: islands with 300+ contacts are solved with
   **graph coloring** — contacts bucketed so no two in a bucket share a
@@ -87,7 +94,7 @@ controllers, triggers, ragdoll filtering, motors, tuning.
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
-build/melon3d_tests   # 42 checks
+build/melon3d_tests   # 50 checks, incl. closed-form physics laws
 build/melon3d_bench   # benchmark scenes
 ```
 
@@ -167,13 +174,19 @@ both engines can also be compared 1T vs 1T.
 
 ### Results — average ms per step (worst frame in parentheses)
 
+Numbers are for **v1.2**, after the realism audit: friction is now
+measured-correct (Coulomb cone, rolling laws, gyroscopics), which makes
+several scenes do more genuine physical work than the pre-audit engine —
+bodies really slide and roll before settling instead of being glued by an
+inflated friction clamp. The comparison stayed honest in both directions.
+
 | Scene | box3d 1T | Melon3D 1T | Melon3D 16T |
 |---|---|---|---|
-| **churn** — 1500 bodies raining, 25 destroyed+respawned each step | 1.262 (2.04) | 1.10 (1.89) | **0.714 (1.38)** |
-| **rain** — 1000 mixed spheres/capsules/boxes falling | 1.010 (2.17) | 1.21 (3.56) | **0.862 (4.70)** |
-| **stacks** — 8×8 grid of 6-box towers (384 bodies) | 0.046 (0.90) | 0.212 (1.82) | **0.045 (0.68)** |
-| **towers** — 20×20 grid of 3-box towers (1200 bodies) | 0.144 (3.02) | 0.635 (5.57) | **0.142 (2.28)** |
-| **pyramid** — 210-box pyramid, one contact island | **0.123** (1.66) | 0.340 (2.00) | 0.358 (2.41) |
+| **churn** — 1500 bodies raining, 25 destroyed+respawned each step | 1.262 (2.04) | 1.48 (3.5) | **0.88 (1.4)** |
+| **rain** — 1000 mixed spheres/capsules/boxes falling | **1.010** (2.17) | 1.54 (5.5) | 1.09 (5.6) |
+| **stacks** — 8×8 grid of 6-box towers (384 bodies) | **0.046** (0.90) | 0.240 (2.1) | 0.056 (0.84) |
+| **towers** — 20×20 grid of 3-box towers (1200 bodies) | **0.144** (3.02) | 0.81 (9.6) | 0.18 (2.8) |
+| **pyramid** — 210-box pyramid, one contact island | **0.123** (1.66) | 0.39 (2.2) | 0.41 (2.3) |
 
 Fixed per-step cost of a fully-settled (asleep) scene, Melon3D 8 threads —
 a scaling metric, not a box3d comparison: 2400 boxes ≈ 0.08 ms, 8000
@@ -213,23 +226,27 @@ the summary table reflects current numbers, which are equal or better.)
 
 ### Reading the numbers
 
-- **Melon3D 16T is at or ahead of box3d 1T on four of five scenes**
-  (churn, rain, stacks, towers). Streaming churn is ~43% faster and rain
-  ~15% faster; stacks and towers are at parity. These are the workloads
-  the architecture was shaped for: allocation-free stage dispatch, a hash
-  grid indifferent to body lifetime, no warm-start state to rebuild, and
-  per-step (not per-substep) collision.
-- **Pyramid** (one big contact island) is box3d's, ~2.9× on average. It is
+- **Churn** (streaming spawn/despawn) stays Melon3D's scene, ~30% faster
+  than box3d with better worst-frame latency — allocation-free stage
+  dispatch, a hash grid indifferent to body lifetime, no warm-start state
+  to rebuild, per-step (not per-substep) collision.
+- **Rain, stacks, towers** are near parity to modestly behind. Part of
+  this is the honest cost of the v1.2 realism audit: with the friction
+  clamp fixed, piles genuinely slide and roll while settling (more awake
+  steps), the gyroscopic term and exact rotation integration add per-body
+  work, and curved contacts recompute their geometric arms. We chose
+  measured-correct physics over the faster glue.
+- **Pyramid** (one big contact island) is box3d's, ~3× on average. It is
   dominated by *settle time*, not step speed: box3d's warm-started solver
   drives residual velocities below the sleep threshold in fewer frames, so
-  the pile sleeps sooner. Melon3D's awake-step cost is close; the gap is
-  how long the single island stays awake.
+  the pile sleeps sooner.
 - **Large sleeping scenes**: the per-step cost of a fully-settled scene is
   a few compact array scans, so tens of thousands of at-rest bodies stay
   affordable (see the fixed-cost figures above).
-- **Worst-frame latency**: Melon3D is at or better than box3d on churn,
-  stacks and towers — frame pacing benefits from the same properties that
-  win the streaming scene.
+- **Physics accuracy is benchmarked too**: the test suite checks Coulomb
+  cone onset, `g(sinθ−μcosθ)` sliding, `5/7·g·sinθ` rolling, `2/7·ωr`
+  spin conversion and the Dzhanibekov flip against closed-form mechanics
+  on every CI run.
 
 Reproduction: [`bench_compare/`](bench_compare/README.md) contains a
 harness that runs the identical scenes on box3d, with full build
