@@ -240,6 +240,11 @@ def render_frame(bodies, frame, idx):
 def _draw_ball(draw, sc, rad, base):
     # radial gradient faked with concentric circles drifting toward the light
     cx, cy = sc
+    # dark rim first: adjacent round bodies then read as occlusion instead of
+    # merging into one blob (a resting sphere next to a capsule looked like
+    # interpenetration without it)
+    rim = tuple(int(v * 0.35) for v in base)
+    draw.ellipse([cx - rad - SS, cy - rad - SS, cx + rad + SS, cy + rad + SS], fill=rim)
     steps = 14
     for i in range(steps):
         t = i / (steps - 1)

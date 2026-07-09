@@ -950,6 +950,72 @@ static void TestDzhanibekov(void)
 	m3d_world_destroy(w);
 }
 
+// The graph-colored SIMD path only engages for islands with >= 300
+// contacts; the other determinism tests never reach it (github issue #1).
+// A 15x15 raft of touching boxes on the ground forms ONE island with ~650
+// contacts, so the colored path runs for real - and its results must stay
+// bit-identical across every worker count, not just 1 vs 4.
+static void TestColoredPathDeterminism(void)
+{
+	const int workers[] = { 1, 2, 4, 8, 16 };
+	float ref[3] = { 0, 0, 0 };
+	bool refSet = false;
+	bool allSame = true;
+	int coloredIslandSeen = 0;
+
+	for (int wi = 0; wi < 5; ++wi)
+	{
+		m3d_world_def wd = m3d_world_def_default();
+		wd.workerCount = workers[wi];
+		m3d_world* world = m3d_world_create(&wd);
+		AddGround(world);
+
+		// 15x15 raft, boxes touching -> one island, ~420 box-box + 225
+		// ground contacts, comfortably past kBigIslandContacts
+		m3d_body_id last = { -1, 0 };
+		for (int gx = 0; gx < 15; ++gx)
+		{
+			for (int gz = 0; gz < 15; ++gz)
+			{
+				last = AddBox(world, m3d_v3(1.0f * gx - 7.0f, 0.5f, 1.0f * gz - 7.0f),
+							  m3d_v3(0.501f, 0.5f, 0.501f), 0.6f);
+			}
+		}
+		// a few heavy droppers keep the island awake and the packets busy
+		for (int i = 0; i < 5; ++i)
+		{
+			AddBox(world, m3d_v3(2.0f * i - 4.0f, 3.0f + 0.7f * i, 0.5f * i - 1.0f), m3d_v3(0.45f, 0.45f, 0.45f),
+				   0.6f);
+		}
+
+		for (int i = 0; i < 90; ++i)
+		{
+			m3d_world_step(world, 1.0f / 60.0f, 4);
+			m3d_profile p = m3d_world_profile(world);
+			if (p.touchingContactCount >= 300 && p.islandCount <= 8)
+			{
+				++coloredIslandSeen;
+			}
+		}
+
+		m3d_vec3 p = m3d_body_position(world, last);
+		if (!refSet)
+		{
+			ref[0] = p.x;
+			ref[1] = p.y;
+			ref[2] = p.z;
+			refSet = true;
+		}
+		else if (p.x != ref[0] || p.y != ref[1] || p.z != ref[2])
+		{
+			allSame = false;
+		}
+		m3d_world_destroy(world);
+	}
+	CHECK(coloredIslandSeen > 0, "raft scene actually reaches the colored-path contact threshold");
+	CHECK(allSame, "colored SIMD path bit-identical across 1/2/4/8/16 workers");
+}
+
 int main(void)
 {
 	TestSphereRest();
@@ -974,6 +1040,7 @@ int main(void)
 	TestRollingPhysics();
 	TestDzhanibekov();
 	TestJointDeterminism();
+	TestColoredPathDeterminism();
 
 	printf("\n%d checks, %d failures\n", g_testCount, g_failCount);
 	return g_failCount == 0 ? 0 : 1;
