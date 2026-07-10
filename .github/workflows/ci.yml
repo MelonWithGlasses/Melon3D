@@ -26,12 +26,17 @@ jobs:
             os: windows-latest
           - name: macos-arm-clang
             os: macos-latest
+          - name: linux-sanitize
+            os: ubuntu-latest
+            cc: gcc
+            cxx: g++
+            sanitize: "-fsanitize=address,undefined -fno-sanitize-recover=all -g"
 
     steps:
       - uses: actions/checkout@v4
 
       - name: Configure
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS="${{ matrix.sanitize }}" -DCMAKE_EXE_LINKER_FLAGS="${{ matrix.sanitize }}"
         env:
           CC: ${{ matrix.cc }}
           CXX: ${{ matrix.cxx }}

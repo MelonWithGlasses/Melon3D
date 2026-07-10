@@ -467,19 +467,36 @@ m3d_weld_joint_def m3d_weld_joint_def_default(void)
 
 m3d_world* m3d_world_create(const m3d_world_def* def)
 {
-	m3d_world* world = new m3d_world();
-	world->def = def != nullptr ? *def : m3d_world_def_default();
-	if (world->def.workerCount < 1)
+	// worker thread creation can fail on exhausted systems; a C API must
+	// not leak an exception (or the half-built world) through that
+	try
 	{
-		world->def.workerCount = 1;
+		m3d_world* world = new m3d_world();
+		world->def = def != nullptr ? *def : m3d_world_def_default();
+		if (world->def.workerCount < 1)
+		{
+			world->def.workerCount = 1;
+		}
+		if (world->def.gridCellSize <= 0.1f)
+		{
+			world->def.gridCellSize = 2.5f;
+		}
+		try
+		{
+			world->pool = new ThreadPool(world->def.workerCount);
+		}
+		catch (...)
+		{
+			delete world;
+			return nullptr;
+		}
+		memset(&world->profile, 0, sizeof(world->profile));
+		return world;
 	}
-	if (world->def.gridCellSize <= 0.1f)
+	catch (...)
 	{
-		world->def.gridCellSize = 2.5f;
+		return nullptr;
 	}
-	world->pool = new ThreadPool(world->def.workerCount);
-	memset(&world->profile, 0, sizeof(world->profile));
-	return world;
 }
 
 void m3d_world_destroy(m3d_world* world)

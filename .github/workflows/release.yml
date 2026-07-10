@@ -1,0 +1,35 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and test
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --parallel
+          ctest --test-dir build --output-on-failure
+
+      - name: Amalgamate single-file build
+        run: |
+          python3 tools/amalgamate.py dist
+          cp include/melon3d.h dist/
+          cd dist && zip melon3d-single-file.zip melon3d_single.cpp melon3d.h
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "Melon3D ${GITHUB_REF_NAME}" \
+            --generate-notes \
+            dist/melon3d-single-file.zip
