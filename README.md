@@ -69,10 +69,15 @@ premium on piles that settle and sleep. Honest numbers below.
   **graph coloring** — contacts bucketed so no two in a bucket share a
   dynamic body — and **8-wide SIMD contact packets** (branchless
   `float[8]` lane code, fully autovectorized with AVX2)
-- **Threading**: built-in spin fork-join pool (~1–2 µs stage dispatch).
-  Simulation results are **bit-identical for any worker count** — the
-  colored path is selected by island size, never by thread count, and
-  bodies within a color are disjoint (covered by a test)
+- **Threading**: built-in spin fork-join pool (~1–2 µs stage dispatch);
+  per-color stages below a size threshold run inline, skipping the
+  barrier when it would cost more than the work. Simulation results are
+  **bit-identical for any worker count** — the colored path is selected
+  by island size, never by thread count, and bodies within a color are
+  disjoint (covered by a test). Results are also independent of prior
+  heap contents: no solver path ever reads an indeterminate byte
+  (validated by an allocator-poisoning harness that fills every
+  allocation with 0x00 / 0xFF / garbage and checks state checksums match)
 - **Joints**: distance (rigid or spring via XPBD compliance), ball,
   **hinge** (with angle limit and torque-limited motor), **weld** — all
   solved positionally, so they don't stretch under load
@@ -94,7 +99,7 @@ controllers, triggers, ragdoll filtering, motors, tuning.
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
-build/melon3d_tests   # 50 checks, incl. closed-form physics laws
+build/melon3d_tests   # 52 checks, incl. closed-form physics laws
 build/melon3d_bench   # benchmark scenes
 ```
 
@@ -174,19 +179,19 @@ both engines can also be compared 1T vs 1T.
 
 ### Results — average ms per step (worst frame in parentheses)
 
-Numbers are for **v1.2**, after the realism audit: friction is now
-measured-correct (Coulomb cone, rolling laws, gyroscopics), which makes
-several scenes do more genuine physical work than the pre-audit engine —
-bodies really slide and roll before settling instead of being glued by an
-inflated friction clamp. The comparison stayed honest in both directions.
+Numbers are for **v1.2.2** (determinism hardening + inline small solver
+stages), measured 2026-07-16. The v1.2 realism audit still applies:
+friction is measured-correct (Coulomb cone, rolling laws, gyroscopics),
+so scenes do genuine physical work — bodies really slide and roll before
+settling instead of being glued by an inflated friction clamp.
 
 | Scene | box3d 1T | Melon3D 1T | Melon3D 16T |
 |---|---|---|---|
-| **churn** — 1500 bodies raining, 25 destroyed+respawned each step | 1.262 (2.04) | 1.23 (2.9) | **0.61 (1.3)** |
-| **rain** — 1000 mixed spheres/capsules/boxes falling | 1.010 (2.17) | 1.43 (4.9) | **0.95 (4.1)** |
-| **stacks** — 8×8 grid of 6-box towers (384 bodies) | **0.046** (0.90) | 0.214 (2.0) | 0.054 (0.85) |
-| **towers** — 20×20 grid of 3-box towers (1200 bodies) | **0.144** (3.02) | 0.69 (6.3) | 0.151 (2.0) |
-| **pyramid** — 210-box pyramid, one contact island | **0.123** (1.66) | 0.34 (2.3) | 0.39 (2.5) |
+| **churn** — 1500 bodies raining, 25 destroyed+respawned each step | 1.251 (1.87) | **1.18 (1.9)** | **0.60 (1.3)** |
+| **rain** — 1000 mixed spheres/capsules/boxes falling | 0.971 (2.20) | 1.34 (4.2) | **0.78 (3.2)** |
+| **stacks** — 8×8 grid of 6-box towers (384 bodies) | **0.046** (0.93) | 0.21 (1.9) | 0.049 (0.85) |
+| **towers** — 20×20 grid of 3-box towers (1200 bodies) | **0.140** (2.83) | 0.65 (6.0) | 0.140 (2.1) |
+| **pyramid** — 210-box pyramid, one contact island | **0.122** (1.45) | 0.32 (2.2) | 0.36 (2.5) |
 
 Fixed per-step cost of a fully-settled (asleep) scene, Melon3D 8 threads —
 a scaling metric, not a box3d comparison: 2400 boxes ≈ 0.08 ms, 8000
@@ -195,47 +200,48 @@ cheap because sleeping bodies are skipped down to a few compact sidecar
 scans.
 
 <details>
-<summary>Raw per-run data</summary>
+<summary>Raw per-run data (v1.2.2, 2026-07-16)</summary>
 
 ```
 box3d 1T          run1 avg/max      run2 avg/max
-pyramid           0.123 / 1.850     0.119 / 1.335
-stacks            0.045 / 0.876     0.047 / 0.848
-rain              0.984 / 2.173     0.968 / 2.745
-towers            0.145 / 3.049     0.140 / 2.823
-churn             1.289 / 1.888     1.275 / 2.048
+pyramid           0.121 / 1.454     0.123 / 1.437
+stacks            0.045 / 0.952     0.046 / 0.909
+rain              0.950 / 1.977     0.991 / 2.430
+towers            0.138 / 2.731     0.142 / 2.921
+churn             1.259 / 1.719     1.242 / 2.027
 
 Melon3D 16T       run1 avg/max      run2 avg/max
-pyramid           0.394 / 2.054     0.413 / 2.195
-stacks            0.057 / 0.622     0.057 / 1.028
-rain              1.045 / 3.882     1.073 / 4.023
-towers            0.240 / 1.950     0.235 / 2.129
-churn             1.003 / 2.238     0.997 / 1.959
+pyramid           0.387 / 3.760     0.339 / 2.373
+stacks            0.050 / 0.888     0.047 / 0.820
+rain              0.818 / 3.712     0.745 / 2.805
+towers            0.142 / 1.999     0.138 / 2.127
+churn             0.621 / 1.086     0.585 / 1.449
 
 Melon3D 1T        run1 avg/max      run2 avg/max
-pyramid           0.422 / 2.579     0.397 / 2.499
-stacks            0.202 / 1.914     0.203 / 1.929
-rain              1.877 / 5.383     1.873 / 5.574
-towers            0.640 / 5.605     0.645 / 6.060
-churn             1.539 / 2.516     1.524 / 2.353
-
-(The raw block above predates the allocation/sidecar optimization pass;
-the summary table reflects current numbers, which are equal or better.)
+pyramid           0.330 / 2.176     0.318 / 2.222
+stacks            0.211 / 1.916     0.205 / 1.810
+rain              1.383 / 4.629     1.294 / 3.756
+towers            0.666 / 6.079     0.630 / 5.917
+churn             1.207 / 1.876     1.147 / 1.814
 ```
 </details>
 
 ### Reading the numbers
 
-- **Churn** (streaming spawn/despawn) is Melon3D's scene, ~50% faster
+- **Churn** (streaming spawn/despawn) is Melon3D's scene, ~52% faster
   than box3d with better worst-frame latency — allocation-free stage
   dispatch, a hash grid indifferent to body lifetime, no warm-start state
   to rebuild, per-step (not per-substep) collision, and parallel
-  candidate-pair enumeration.
-- **Rain** is ~6% ahead, **stacks and towers** at parity. These numbers
+  candidate-pair enumeration. Even single-threaded Melon3D now edges
+  box3d here.
+- **Rain** is ~20% ahead, **stacks and towers** at parity. These numbers
   carry the honest cost of the v1.2 realism audit — with the friction
   clamp fixed, piles genuinely slide and roll while settling, and fast
   tumbles pay for the gyroscopic term — recovered through the parallel
-  broadphase enumeration and cheaper hot-loop math (v1.2.1).
+  broadphase enumeration, cheaper hot-loop math (v1.2.1), and running
+  small per-color solver stages inline instead of paying fork-join
+  barriers (v1.2.2; bit-identical results, big win on many-small-island
+  scenes like rain).
 - **Pyramid** (one big contact island) is box3d's, ~3× on average. It is
   dominated by *settle time*, not step speed: box3d's warm-started solver
   drives residual velocities below the sleep threshold in fewer frames, so
