@@ -1239,6 +1239,14 @@ void SolveIslandColoredXPBD(m3d_world* world, const std::vector<int32_t>& bodyIn
 		return g < 4 ? 4 : g;
 	};
 
+	// Fork-join barriers (~1us) dwarf the actual work when a stage only has
+	// a handful of items, and mid-size islands (a lone pyramid) burn half a
+	// substep on barriers alone. Contacts within a color never share a
+	// dynamic body, so running a small stage inline is bit-identical to the
+	// parallel dispatch - this is purely a scheduling decision.
+	constexpr int32_t kMinParallelPackets = 8;   // 8-wide packets per stage
+	constexpr int32_t kMinParallelContacts = 96; // friction/velocity lanes
+
 	const int32_t bodyCount = (int32_t)bodyIndices.size();
 	const int32_t contactCount = (int32_t)contactIndices.size();
 
@@ -1284,8 +1292,18 @@ void SolveIslandColoredXPBD(m3d_world* world, const std::vector<int32_t>& bodyIn
 			for (int32_t color = 0; color < colorCount; ++color)
 			{
 				auto& packs = world->colorPackets[color];
-				pool->ParallelFor((int32_t)packs.size(), 1,
-								  [&](int32_t k) { SolvePacketNormals(world, packs[k], maxCorrection); });
+				if ((int32_t)packs.size() < kMinParallelPackets)
+				{
+					for (ContactPacket8& pk : packs)
+					{
+						SolvePacketNormals(world, pk, maxCorrection);
+					}
+				}
+				else
+				{
+					pool->ParallelFor((int32_t)packs.size(), 1,
+									  [&](int32_t k) { SolvePacketNormals(world, packs[k], maxCorrection); });
+				}
 			}
 			for (int32_t ci : world->overflowContacts)
 			{
@@ -1303,8 +1321,18 @@ void SolveIslandColoredXPBD(m3d_world* world, const std::vector<int32_t>& bodyIn
 		for (int32_t color = 0; color < colorCount; ++color)
 		{
 			auto& bucket = world->colorBuckets[color];
-			pool->ParallelFor((int32_t)bucket.size(), colorGrain((int32_t)bucket.size()),
-							  [&](int32_t k) { ApplyContactFriction(world, world->contacts[bucket[k]]); });
+			if ((int32_t)bucket.size() < kMinParallelContacts)
+			{
+				for (int32_t ci : bucket)
+				{
+					ApplyContactFriction(world, world->contacts[ci]);
+				}
+			}
+			else
+			{
+				pool->ParallelFor((int32_t)bucket.size(), colorGrain((int32_t)bucket.size()),
+								  [&](int32_t k) { ApplyContactFriction(world, world->contacts[bucket[k]]); });
+			}
 		}
 		for (int32_t ci : world->overflowContacts)
 		{
@@ -1316,8 +1344,18 @@ void SolveIslandColoredXPBD(m3d_world* world, const std::vector<int32_t>& bodyIn
 		for (int32_t color = 0; color < colorCount; ++color)
 		{
 			auto& bucket = world->colorBuckets[color];
-			pool->ParallelFor((int32_t)bucket.size(), colorGrain((int32_t)bucket.size()),
-							  [&](int32_t k) { SolveContactVelocity(world, world->contacts[bucket[k]], h, gravityLen); });
+			if ((int32_t)bucket.size() < kMinParallelContacts)
+			{
+				for (int32_t ci : bucket)
+				{
+					SolveContactVelocity(world, world->contacts[ci], h, gravityLen);
+				}
+			}
+			else
+			{
+				pool->ParallelFor((int32_t)bucket.size(), colorGrain((int32_t)bucket.size()),
+								  [&](int32_t k) { SolveContactVelocity(world, world->contacts[bucket[k]], h, gravityLen); });
+			}
 		}
 		for (int32_t ci : world->overflowContacts)
 		{
