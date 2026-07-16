@@ -977,6 +977,13 @@ void SolveIslandXPBD(m3d_world* world, const std::vector<int32_t>& bodyIndices,
 // SIMD contact packets for the colored normal projection
 // ---------------------------------------------------------------------------
 
+// pad source for inactive points. Never read points[0] for them: a contact
+// whose manifold regenerated to pointCount == 0 mid-step skips the substep
+// freeze, so its points hold stale (or, for a fresh contact, uninitialized)
+// data. The solve multiplies inactive lanes by a zero gate, but 0 * NaN is
+// still NaN - garbage Jacobians would poison the lane's real body.
+static const ManifoldPoint kZeroPoint = {};
+
 static void BuildColorPackets(m3d_world* world, const std::vector<int32_t>& bucket,
 							  std::vector<ContactPacket8>& packs)
 {
@@ -1012,7 +1019,7 @@ static void BuildColorPackets(m3d_world* world, const std::vector<int32_t>& buck
 			for (int32_t j = 0; j < 4; ++j)
 			{
 				bool on = j < pts;
-				const ManifoldPoint& mp = c.manifold.points[on ? j : 0];
+				const ManifoldPoint& mp = on ? c.manifold.points[j] : kZeroPoint;
 				pk.active[j][l] = on ? 1.0f : 0.0f;
 				pk.lax[j][l] = mp.localAnchorA.x;
 				pk.lay[j][l] = mp.localAnchorA.y;

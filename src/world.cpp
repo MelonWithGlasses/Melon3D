@@ -1540,7 +1540,12 @@ void m3d_world_step(m3d_world* world, float dt, int substepCount)
 	auto createContact = [&](int32_t lo, int32_t hi) {
 		Body& lb = world->bodies[lo];
 		Body& hb = world->bodies[hi];
-		Contact c;
+		// value-init: manifold points must not carry indeterminate bytes.
+		// The compiler legally skips copying uninitialized fields into the
+		// contacts array, so heap residue would leak into points[] and reach
+		// the solver through any pointCount == 0 window (NaN patterns there
+		// made results depend on prior heap contents).
+		Contact c{};
 		c.bodyA = lo;
 		c.bodyB = hi;
 		c.key = ContactKey(lo, hi);
